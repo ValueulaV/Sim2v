@@ -1,0 +1,40 @@
+# sim2v configuration
+
+verilator: /workspace/S/mazhewei/miniconda3/envs/sim2v/bin/verilator
+yosys: /workspace/S/mazhewei/miniconda3/envs/sim2v/bin/yosys
+
+llm:
+  model: claude-sonnet-4-6
+  max_workers: 12
+  sample_num: 1
+  max_tasks: 0
+  infer_use_think: false
+  debug_use_think: false
+
+input_dirs:
+  # - io_generator/prf_bsd
+  # - io_generator/rob_bsd
+  - io_generator/isu_bsd
+
+output_dir: output
+
+prompt:
+  struct_expand_depth: 1
+
+io_mapping:
+  strategy: pi_to_simulator_v1
+
+combine:
+  default_init: zero_all
+
+verify:
+  max_test_vectors: 10000000
+  exhaustive_threshold: 20
+  parallel_jobs: 32
+
+snippet:
+  enabled: true
+  max_workers: 16
+  parallel_jobs: 12
+  max_iterations: 8
+  max_compare_targets: 8

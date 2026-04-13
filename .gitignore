@@ -1,0 +1,12 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated outputs
+output/
+
+# Local artifacts
+*.tmp
+
+# io_generator
+io_generator/
