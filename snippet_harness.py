@@ -86,6 +86,11 @@ Relevant constants:
 {constants_block}
 ```
 
+Project config excerpts:
+```cpp
+{project_context}
+```
+
 Type context:
 ```cpp
 {cpp_type_sources}
@@ -142,10 +147,8 @@ def build_method_io_targets(module_info, method_name, max_targets):
     # 实现上则是 libclang 读写集 + 文本回退 + 精细路径修正的组合。
     method = next((m for m in module_info["methods"] if m["name"] == method_name), None)
     method_body = _expand_local_aliases(method["body"] if method else "")
-    helpers = bsd_analyzer.extract_method_helpers(
-        method_body,
-        bsd_analyzer.parse_helper_functions(),
-    ) if method else {}
+    helper_db = bsd_analyzer.build_helper_db(module_info)
+    helpers = bsd_analyzer.extract_method_helpers(method_body, helper_db) if method else {}
     cpp_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         "io_generator",
@@ -157,6 +160,9 @@ def build_method_io_targets(module_info, method_name, max_targets):
     writes = sorted((rw or {}).get(method_name, {}).get("writes", set()))
     writes = sorted(set(writes) | set(_fallback_write_targets(module_info, method_name, method_body)))
     reads = sorted(set(reads) | set(_fallback_read_targets(module_info, method_name, method_body)))
+    hint_reads, hint_writes = _project_specific_io_hints(module_info, method_name)
+    reads = sorted(set(reads) | set(hint_reads))
+    writes = sorted(set(writes) | set(hint_writes))
     exact_paths = _extract_precise_signal_paths(method_body + "\n" + "\n".join(helpers.values()))
     reads = _refine_targets_with_exact_paths(reads, exact_paths)
     writes = _refine_targets_with_exact_paths(writes, exact_paths)
@@ -189,6 +195,7 @@ def build_signal_plan(module_info, targets, instance_name, loop_domains=None, re
     offset = 0
     for leaf in dedup:
         leaf["sv_expr"] = _sv_leaf_expr(module_info, leaf["label"])
+        leaf["sv_lhs_expr"] = _sv_leaf_lhs_expr(module_info, leaf["label"])
         signal_map.append({"path": leaf["label"], "width": leaf["width"], "offset": offset})
         leaf["offset"] = offset
         offset += leaf["width"]
@@ -232,8 +239,10 @@ def build_sv_wrapper(module_name, combine_info, method_name, snippet_code, input
         "",
         "always_comb begin",
     ])
+    default_decl_names = _default_decl_names(input_plan, compare_plan, snippet_code)
     parts.extend(combine_helpers.build_default_assignments(
-        [*input_decls, *internal_decls, *output_decls],
+        [decl for decl in [*input_decls, *internal_decls, *output_decls]
+         if _decl_name(decl) in default_decl_names],
         strategy="zero_all",
     ))
     parts.extend([
@@ -259,7 +268,7 @@ def build_sv_wrapper(module_name, combine_info, method_name, snippet_code, input
     return "\n".join(parts)
 
 
-def build_cpp_reference(*, wrapper_text, module_type, instance_name, method_name, input_plan, compare_plan):
+def build_cpp_reference(*, wrapper_text, module_info, module_type, instance_name, method_name, input_plan, compare_plan):
     # 这里生成的不是原始 simulator 头文件，而是“只执行当前 method”的参考壳。
     # 它和 SV wrapper 共用同一份 input_plan / compare_plan，
     # 从而保证两边观察到的输入输出边界完全一致。
@@ -292,9 +301,11 @@ def build_cpp_reference(*, wrapper_text, module_type, instance_name, method_name
         "}",
         "void io_generator_outer(bool* pi, bool* po) {",
         prefix.rstrip(),
+        _build_cpp_vector_resize_preamble(module_info, instance_name, input_plan, compare_plan, phase="before_input"),
         "    int cursor = 0;",
         _build_cpp_input_unpack(input_plan),
         f"    {instance_name}.{method_name}();",
+        _build_cpp_vector_resize_preamble(module_info, instance_name, input_plan, compare_plan, phase="before_output"),
         "    for (int i = 0; i < PO_WIDTH; ++i) po[i] = false;",
         "    cursor = 0;",
     ]
@@ -305,6 +316,50 @@ def build_cpp_reference(*, wrapper_text, module_type, instance_name, method_name
         )
     lines.extend(["}", "#endif"])
     return "\n".join(lines) + "\n"
+
+
+def _build_cpp_vector_resize_preamble(module_info, instance_name, input_plan, compare_plan, phase):
+    # Python 侧把若干 std::vector 建模成了“定长数组”。
+    # C++ reference 在按下标读写这些路径前，需要显式 resize 到对应上界，
+    # 否则像 `latency_pipe[i]` 这类访问会越界。
+    if module_info.get("module_type") != "Isu":
+        return "    // (no vector resize preamble)"
+
+    labels = []
+    for plan in (input_plan, compare_plan):
+        labels.extend(item.get("path", "") for item in plan.get("signal_map", []))
+        labels.extend(leaf.get("label", "") for leaf in plan.get("leaves", []))
+
+    needs_configs = any(label.startswith("configs[") for label in labels)
+    needs_iq_ports = any(label.startswith("iqs[") and ".ports[" in label for label in labels)
+    needs_cfg_ports = any(label.startswith("configs[") and ".ports[" in label for label in labels)
+    needs_iq_entry = any(label.startswith("iqs[") and ".entry[" in label for label in labels)
+    needs_iq_entry_1 = any(label.startswith("iqs[") and ".entry_1[" in label for label in labels)
+    needs_latency_pipe = any(label.startswith("latency_pipe[") for label in labels)
+    needs_latency_pipe_1 = any(label.startswith("latency_pipe_1[") for label in labels)
+    needs_committed = any(label.startswith("committed_indices_buf[") for label in labels)
+
+    lines = []
+    if needs_configs:
+        lines.append(f"    if ({instance_name}.configs.size() < IQ_NUM) {instance_name}.configs.resize(IQ_NUM);")
+    if needs_iq_ports:
+        lines.append(f"    for (int __iq = 0; __iq < IQ_NUM; ++__iq) if ({instance_name}.iqs[__iq].ports.size() < ISSUE_WIDTH) {instance_name}.iqs[__iq].ports.resize(ISSUE_WIDTH);")
+    if needs_cfg_ports:
+        lines.append(f"    for (int __iq = 0; __iq < IQ_NUM; ++__iq) if ({instance_name}.configs[__iq].ports.size() < ISSUE_WIDTH) {instance_name}.configs[__iq].ports.resize(ISSUE_WIDTH);")
+    if needs_iq_entry:
+        lines.append(f"    for (int __iq = 0; __iq < IQ_NUM; ++__iq) if ({instance_name}.iqs[__iq].entry.size() < MAX_IQ_SIZE) {instance_name}.iqs[__iq].entry.resize(MAX_IQ_SIZE);")
+    if needs_iq_entry_1:
+        lines.append(f"    for (int __iq = 0; __iq < IQ_NUM; ++__iq) if ({instance_name}.iqs[__iq].entry_1.size() < MAX_IQ_SIZE) {instance_name}.iqs[__iq].entry_1.resize(MAX_IQ_SIZE);")
+    if needs_latency_pipe:
+        lines.append(f"    if ({instance_name}.latency_pipe.size() < DIV_MAX_LATENCY) {instance_name}.latency_pipe.resize(DIV_MAX_LATENCY);")
+    if needs_latency_pipe_1:
+        lines.append(f"    if ({instance_name}.latency_pipe_1.size() < DIV_MAX_LATENCY) {instance_name}.latency_pipe_1.resize(DIV_MAX_LATENCY);")
+    if needs_committed:
+        lines.append(f"    for (int __ci = 0; __ci < IQ_NUM; ++__ci) if ({instance_name}.committed_indices_buf[__ci].size() < ISSUE_WIDTH) {instance_name}.committed_indices_buf[__ci].resize(ISSUE_WIDTH);")
+    if not lines:
+        return "    // (no vector resize preamble)"
+    lines.insert(0, f"    // ---- Vector resize preamble ({phase}) ----")
+    return "\n".join(lines)
 
 
 def build_debug_prompt(*, module_info, method, method_ctx, input_plan, compare_plan, current_snippet, verify_message):
@@ -324,6 +379,7 @@ def build_debug_prompt(*, module_info, method, method_ctx, input_plan, compare_p
         internal_vars="\n".join(internal_vars),
         output_vars="\n".join(output_vars),
         constants_block=constants_block,
+        project_context=method_ctx.get("project_context", "") or "(none)",
         cpp_type_sources=method_ctx["cpp_type_sources"] or "(none)",
         sv_typedefs=method_ctx["sv_typedefs"] or "(none)",
         method_body=method["body"],
@@ -385,7 +441,7 @@ def write_json(path, data):
 def collect_loop_domains(text):
     domains = {}
     pat = re.compile(
-        r"for\s*\(\s*(?:int|integer)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);\s*"
+        r"for\s*\(\s*(?:int|integer|size_t|uint32_t)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);\s*"
         r"\1\s*(<=|<)\s*([^;]+);\s*(?:\+\+\1|\1\+\+|\1\s*\+=\s*1)\s*\)"
     )
     for match in pat.finditer(text or ""):
@@ -396,7 +452,9 @@ def collect_loop_domains(text):
             continue
         stop = end if cmp_op == "<" else end + 1
         if stop > start:
-            domains[name] = list(range(start, stop))
+            merged = set(domains.get(name, []))
+            merged.update(range(start, stop))
+            domains[name] = sorted(merged)
     return domains
 
 
@@ -450,7 +508,7 @@ def _fallback_read_targets(module_info, method_name, method_body=None):
     if not method:
         return []
     body = _expand_local_aliases(method_body if method_body is not None else method["body"])
-    helpers = bsd_analyzer.extract_method_helpers(body, bsd_analyzer.parse_helper_functions())
+    helpers = bsd_analyzer.extract_method_helpers(body, bsd_analyzer.build_helper_db(module_info))
     hints = bsd_analyzer.get_method_signal_width_hints(
         body,
         helpers,
@@ -468,6 +526,94 @@ def _fallback_read_targets(module_info, method_name, method_body=None):
         if canon:
             out.append(canon)
     return sorted(set(out))
+
+
+def _project_specific_io_hints(module_info, method_name):
+    # libclang/text fallback 对容器副作用不敏感时，在这里补项目内已知的方法级 hints。
+    if module_info.get("module_type") != "Isu":
+        return [], []
+
+    hints = {
+        "init": (
+            [],
+            [
+                "configs[i].id",
+                "configs[i].size",
+                "configs[i].dispatch_width",
+                "configs[i].supported_ops",
+                "configs[i].ports.port_idx",
+                "configs[i].ports.capability_mask",
+                "iqs[i].id",
+                "iqs[i].size",
+                "iqs[i].dispatch_width",
+                "iqs[i].count",
+                "iqs[i].count_1",
+                "iqs[i].wake_words_per_row",
+            ],
+        ),
+        "comb_awake": (
+            [
+                "latency_pipe.valid",
+                "latency_pipe.countdown",
+                "latency_pipe.dest_preg",
+            ],
+            [],
+        ),
+        "comb_calc_latency_next": (
+            [
+                "latency_pipe.valid",
+                "latency_pipe.countdown",
+                "latency_pipe.dest_preg",
+                "latency_pipe.br_mask",
+                "latency_pipe.rob_idx",
+                "latency_pipe.rob_flag",
+            ],
+            [
+                "latency_pipe_1.valid",
+                "latency_pipe_1.countdown",
+                "latency_pipe_1.dest_preg",
+                "latency_pipe_1.br_mask",
+                "latency_pipe_1.rob_idx",
+                "latency_pipe_1.rob_flag",
+            ],
+        ),
+        "comb_enq": (
+            [
+                "out.iss_awake.wake.valid",
+                "out.iss_awake.wake.preg",
+                "iqs[i].count_1",
+                "iqs[i].size",
+                "iqs[i].entry_1.valid",
+            ],
+            [
+                "iqs[i].count_1",
+                "iqs[i].entry_1.valid",
+                "iqs[i].entry_1.uop.dest_preg",
+                "iqs[i].entry_1.uop.src1_preg",
+                "iqs[i].entry_1.uop.src2_preg",
+                "iqs[i].entry_1.uop.src1_busy",
+                "iqs[i].entry_1.uop.src2_busy",
+                "iqs[i].entry_1.uop.op",
+            ],
+        ),
+        "comb_flush": (
+            [
+                "iqs[i].count_1",
+                "iqs[i].entry_1.valid",
+                "iqs[i].entry_1.uop.br_mask",
+                "latency_pipe_1.valid",
+                "latency_pipe_1.br_mask",
+            ],
+            [
+                "iqs[i].count_1",
+                "iqs[i].entry_1.valid",
+                "iqs[i].entry_1.uop.br_mask",
+                "latency_pipe_1.valid",
+                "latency_pipe_1.br_mask",
+            ],
+        ),
+    }
+    return hints.get(method_name, ([], []))
 
 
 def _filter_targets(module_info, raw, *, max_targets, allow_inputs):
@@ -550,6 +696,34 @@ def _module_interface_type(module_info, field_name):
     if camel in module_info["structs"]:
         return camel
     return None
+
+
+def _decl_name(decl):
+    info = combine_helpers.parse_decl(decl)
+    return info["name"] if info else None
+
+
+def _root_name_from_label(label):
+    parts = _split_path_tokens(label)
+    if not parts:
+        return None
+    if parts[0] in ("in", "out") and len(parts) >= 2:
+        return f"{parts[0]}_{escape_sv_keyword(_split_indexed_token(parts[1])[0])}"
+    return escape_sv_keyword(_split_indexed_token(parts[0])[0])
+
+
+def _default_decl_names(input_plan, compare_plan, snippet_code):
+    names = {"po"}
+    for plan in (input_plan, compare_plan):
+        for leaf in plan.get("leaves", []):
+            root = _root_name_from_label(leaf.get("label", ""))
+            if root:
+                names.add(root)
+    for path in _extract_precise_signal_paths(snippet_code or ""):
+        root = _root_name_from_label(_canonical_target_path(path))
+        if root:
+            names.add(root)
+    return names
 
 
 def _order_signal_leaves_by_dependency(leaves):
@@ -646,8 +820,15 @@ def _build_roots(module_info, instance_name):
 
 
 def _sv_leaf_expr(module_info, label):
-    # 对于最终要打包到 po[] 的叶子路径，这里把“语义路径”降成 SV 可取值表达式。
-    # 如果路径落在 packed struct 的子字段里，需要额外计算 bit offset。
+    # 叶子路径优先保留结构化访问形式。
+    # 这比把 packed struct 降成整块 bit-slice 更稳定，也更利于 Yosys/Verilator 报错定位。
+    return _sv_path_expr(label)
+
+
+def _sv_leaf_lhs_expr(module_info, label):
+    # 输入解包落到 packed struct/packed array 子字段时，
+    # Yosys 对 `arr[idx].field = ...` 这类左值支持并不稳定。
+    # 这里保守地把 LHS 降成位切片，避免前端语法问题。
     roots = _build_roots(module_info, instance_name="")
     parts = _split_path_tokens(label)
     if not parts:
@@ -1041,6 +1222,18 @@ def _apply_explicit_indices(nodes, index_exprs, runtime_ids, instance_name, loop
                     next_nodes.append(node)
                     continue
                 dim, rest = int(dims[0]), dims[1:]
+                const_idx = bsd_analyzer._try_eval_const_expr(expr_variant.strip(), bsd_analyzer.KNOWN_CONSTANTS)
+                if const_idx is not None:
+                    if 0 <= int(const_idx) < dim:
+                        idx = int(const_idx)
+                        next_nodes.append({
+                            **node,
+                            "array_dims": rest,
+                            "sv_expr": f"{node['sv_expr']}[{idx}]",
+                            "cpp_expr": f"{node['cpp_expr']}[{idx}]",
+                            "label": f"{node['label']}[{idx}]",
+                        })
+                    continue
                 if _should_expand_index_expr(expr_variant, runtime_ids):
                     for idx in range(dim):
                         next_nodes.append({
@@ -1212,10 +1405,11 @@ def _build_sv_input_unpack(input_plan):
     # input_plan 已经给出每个叶子信号在 pi 中的 offset/width，这里只负责直译成赋值语句。
     lines = []
     for leaf in input_plan["leaves"]:
+        lhs = leaf.get("sv_lhs_expr", leaf["sv_expr"])
         if leaf["width"] == 1:
-            lines.append(f"    {leaf['sv_expr']} = pi[{leaf['offset']}];")
+            lines.append(f"    {lhs} = pi[{leaf['offset']}];")
         else:
-            lines.append(f"    {leaf['sv_expr']} = pi[{leaf['offset']} +: {leaf['width']}];")
+            lines.append(f"    {lhs} = pi[{leaf['offset']} +: {leaf['width']}];")
     return "\n".join(lines) if lines else "    // (no free inputs)"
 
 

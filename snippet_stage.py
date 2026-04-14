@@ -110,7 +110,7 @@ def run(cfg, logger, run_dir, target=None):
             continue
 
         combine_info = prompt_builder.get_combine_info(rel_dir, repo_root)
-        helper_db = bsd_analyzer.parse_helper_functions()
+        helper_db = bsd_analyzer.build_helper_db(module_info)
         all_constants = bsd_analyzer.parse_all_constants()
         method_ctx = _build_method_context(module_info, combine_info, helper_db, all_constants)
         wrapper_header = prompt_builder._find_io_generator_outer_header(full_dir)
@@ -266,6 +266,7 @@ def _run_one_method(*, cfg, logger, provider, client, task_dir, module_info,
             )
             ref_header = harness.build_cpp_reference(
                 wrapper_text=wrapper_text,
+                module_info=module_info,
                 module_type=module_info["module_type"],
                 instance_name=instance_name,
                 method_name=method["name"],
@@ -384,6 +385,7 @@ def _build_method_context(module_info, combine_info, helper_db, all_constants):
         method_helpers = bsd_analyzer.extract_method_helpers(method["body"], helper_db)
         logic_text = method["body"] + "\n" + "\n".join(method_helpers.values())
         used_consts = prompt_builder.select_prompt_constants(all_constants, logic_text)
+        project_context = bsd_analyzer.project_context_for_logic(logic_text)
         order = bsd_analyzer.get_struct_order_for_method(
             module_info["structs"],
             module_info["module_type"],
@@ -401,6 +403,7 @@ def _build_method_context(module_info, combine_info, helper_db, all_constants):
                 method_body=method["body"],
                 expand_depth=1,
             ),
+            "project_context": project_context,
             "var_decls": combine_info["var_decls"],
         }
     return contexts

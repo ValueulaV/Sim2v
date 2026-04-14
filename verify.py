@@ -20,6 +20,10 @@ def _clip_text(text, limit):
     return text[:limit] + f"\n... [truncated {remain} chars]"
 
 
+def _normalize_tool_path(path):
+    return os.path.expanduser(path) if path else path
+
+
 def verify(cpp_path, verilog_code, module_name, pi_width, po_width,
            exhaustive_threshold=20, max_test_vectors=100000,
            extra_cflags="", output_signal_map=None, verilator_bin="verilator",
@@ -115,6 +119,8 @@ def _materialize_verification_artifacts(*, cpp_path, verilog_code, module_name, 
     # - 用户手工进入 build 目录继续调试
     # - snippet/full verify 复用同一条物化逻辑
     os.makedirs(artifact_dir, exist_ok=True)
+    verilator_bin = _normalize_tool_path(verilator_bin)
+    yosys_bin = _normalize_tool_path(yosys_bin)
 
     is_sv = "typedef struct" in verilog_code or "always_comb" in verilog_code
     ext = ".sv" if is_sv else ".v"
@@ -152,7 +158,7 @@ def _materialize_verification_artifacts(*, cpp_path, verilog_code, module_name, 
     build_dir = os.path.join(artifact_dir, "build")
     cflags = f"-std=c++17 -O2 {extra_cflags}".strip()
     cmd = (
-        f'{verilator_bin} -Wno-SYMRSVDWORD --cc "{rtl_path}" --exe "{tb_path}" '
+        f'{verilator_bin} -Wno-SYMRSVDWORD -Wno-WIDTHCONCAT --cc "{rtl_path}" --exe "{tb_path}" '
         f"--build --top-module {module_name} "
         f'--Mdir "{build_dir}" '
         f'-CFLAGS "{cflags}"'
@@ -182,8 +188,8 @@ def _materialize_compile_only_artifacts(*, verilog_code, module_name, verilator_
         "artifact_dir": artifact_dir,
         "module_name": module_name,
         "rtl_path": rtl_path,
-        "verilator_bin": verilator_bin,
-        "yosys_bin": yosys_bin,
+        "verilator_bin": _normalize_tool_path(verilator_bin),
+        "yosys_bin": _normalize_tool_path(yosys_bin),
     }
 
 
@@ -302,6 +308,7 @@ def _run_compile_only(paths):
     cmd = [
         paths["verilator_bin"],
         "-Wno-SYMRSVDWORD",
+        "-Wno-WIDTHCONCAT",
         "--lint-only",
         "--top-module", paths["module_name"],
         paths["rtl_path"],

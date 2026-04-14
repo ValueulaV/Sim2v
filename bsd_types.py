@@ -99,6 +99,21 @@ def _strip_comments(text):
     return re.sub(r"//.*", "", text)
 
 
+VECTOR_FIELD_DIM_HINTS = {
+    ("Isu", "iqs"): ["IQ_NUM"],
+    ("Isu", "configs"): ["IQ_NUM"],
+    ("Isu", "latency_pipe"): ["DIV_MAX_LATENCY"],
+    ("Isu", "latency_pipe_1"): ["DIV_MAX_LATENCY"],
+    ("Isu", "committed_indices_buf"): ["ISSUE_WIDTH"],
+    ("IssueQueueConfig", "ports"): ["ISSUE_WIDTH"],
+    ("IssueQueue", "ports"): ["ISSUE_WIDTH"],
+    ("IssueQueue", "entry"): ["MAX_IQ_SIZE"],
+    ("IssueQueue", "entry_1"): ["MAX_IQ_SIZE"],
+    ("IssueQueue", "wake_matrix_src1"): ["PRF_NUM"],
+    ("IssueQueue", "wake_matrix_src2"): ["PRF_NUM"],
+}
+
+
 def _normalize_const_expr(expr):
     expr = expr.strip()
     if not expr:
@@ -300,6 +315,19 @@ def _extract_project_iq_configs(text, known):
                 "port_num": values[5],
             })
     return configs
+
+
+def _vector_field_extra_dims(record_name, field_name, raw_type_name):
+    if "vector<" not in raw_type_name.replace(" ", ""):
+        return []
+    hint_exprs = VECTOR_FIELD_DIM_HINTS.get((record_name, field_name), [])
+    dims = []
+    for expr in hint_exprs:
+        val = _try_eval_const_expr(expr, KNOWN_CONSTANTS)
+        if val is None:
+            continue
+        dims.append(int(val))
+    return dims
 
 
 def _load_known_constants():
@@ -572,7 +600,7 @@ def _parse_file_structs(content, existing_type_widths=None):
         struct_sources.update(nested_sources)
 
         cleaned = _prepare_record_body_for_fields(record["body"], record["name"])
-        fields = _parse_struct_fields(cleaned, type_widths)
+        fields = _parse_struct_fields(cleaned, type_widths, record["name"])
         if fields:
             structs[record["name"]] = fields
             struct_sources[record["name"]] = record["source"]
@@ -580,7 +608,7 @@ def _parse_file_structs(content, existing_type_widths=None):
     return type_widths, structs, struct_sources
 
 
-def _parse_struct_fields(body, type_widths):
+def _parse_struct_fields(body, type_widths, record_name=None):
     # 字段解析只覆盖当前项目里常见的“简单声明 + 数组维度”模式。
     # 复杂模板、函数指针、宏展开类型等都不在这个解析器的目标范围内。
     fields = []
@@ -619,6 +647,9 @@ def _parse_struct_fields(body, type_widths):
                 if not re.match(r"^\w+$", fname):
                     continue
                 array_dims = None
+            extra_dims = _vector_field_extra_dims(record_name, fname, raw_type_name)
+            if extra_dims:
+                array_dims = (array_dims or []) + extra_dims
             width = _infer_field_width(raw_type_name, type_widths)
             fields.append({
                 "name": fname,
@@ -691,23 +722,12 @@ def extract_method_helpers(method_body, all_helpers):
 
 
 def parse_all_constants():
-    config_path = os.path.join(SIMULATOR_INCLUDE, "config.h")
-    if not os.path.exists(config_path):
-        return {}
     constants = {}
-    with open(config_path) as f:
-        for raw in f:
-            line = raw.strip()
-            if not line.startswith("#define "):
-                continue
-            parts = line.split(None, 2)
-            if len(parts) < 3:
-                continue
-            name = parts[1]
-            expr = parts[2].split("//")[0].strip()
-            if not expr or "(" in name:
-                continue
-            constants[name] = expr
+    for name, value in KNOWN_CONSTANTS.items():
+        if isinstance(value, bool):
+            constants[name] = "1" if value else "0"
+        elif isinstance(value, int):
+            constants[name] = str(value)
     return constants
 
 

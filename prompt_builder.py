@@ -11,10 +11,11 @@ import re
 import io_mapping
 
 from bsd_analyzer import (
-    analyze_module, generate_sv_typedefs, generate_sv_var_declarations,
-    parse_helper_functions, extract_method_helpers,
+    analyze_module, build_helper_db, generate_sv_typedefs, generate_sv_var_declarations,
+    extract_method_helpers,
     parse_all_constants, get_struct_order_for_method, generate_cpp_type_sources,
     get_method_signal_width_hints, KNOWN_CONSTANTS, _try_eval_const_expr,
+    project_context_for_logic,
 )
 
 # ---- Prompt constants ----
@@ -167,6 +168,7 @@ Naming rules:
 {naming_rules}
 {constants_block}
 {signal_width_block}
+{project_context_section}\
 ### END CONTEXT ###
 
 {type_defs_section}\
@@ -312,6 +314,7 @@ def render_method_prompt(
     method_helpers,
     used_constants,
     signal_width_hints,
+    project_context,
     role_intro,
     output_block,
 ):
@@ -331,6 +334,15 @@ def render_method_prompt(
         signal_width_block = f"Signal width hints:\n{width_lines}\n"
     else:
         signal_width_block = ""
+    if project_context.strip():
+        project_context_section = (
+            "Project config excerpts:\n"
+            "```cpp\n"
+            f"{project_context}\n"
+            "```\n"
+        )
+    else:
+        project_context_section = ""
     if cpp_type_sources.strip() or sv_typedefs.strip():
         type_defs_section = (
             "## TYPE DEFINITIONS (C++ -> SV)\n"
@@ -358,6 +370,7 @@ def render_method_prompt(
         naming_rules=SV_NAMING_RULES,
         constants_block=constants_block,
         signal_width_block=signal_width_block,
+        project_context_section=project_context_section,
         type_defs_section=type_defs_section,
         input_vars="\n".join(input_vars),
         output_vars="\n".join(output_vars),
@@ -381,6 +394,7 @@ def render_infer_method_prompt(
     method_helpers,
     used_constants,
     signal_width_hints,
+    project_context,
     use_think=True,
 ):
     return render_method_prompt(
@@ -393,6 +407,7 @@ def render_infer_method_prompt(
         method_helpers=method_helpers,
         used_constants=used_constants,
         signal_width_hints=signal_width_hints,
+        project_context=project_context,
         role_intro=INFER_ROLE_INTRO,
         output_block=_infer_output_block(use_think),
     )
@@ -414,6 +429,7 @@ def build_subtask_prompt(method, helpers_db, all_constants, module_info,
         method["body"], method_helpers,
         module_info["structs"], module_info["module_type"], module_info["type_widths"],
     )
+    project_context = project_context_for_logic(logic_text)
     content = render_infer_method_prompt(
         module_type=module_info["module_type"],
         method_name=method["name"],
@@ -424,6 +440,7 @@ def build_subtask_prompt(method, helpers_db, all_constants, module_info,
         method_helpers=method_helpers,
         used_constants=used_consts,
         signal_width_hints=width_hints,
+        project_context=project_context,
         use_think=infer_use_think,
     )
 
@@ -572,7 +589,6 @@ def build_prompts(input_dirs, output_path, base_dir=".", struct_expand_depth=2,
     # 这一层只做静态任务生成，不调用 LLM。
     # 粒度是：input_dir -> module -> active method -> one JSONL prompt entry。
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    helpers_db = parse_helper_functions()
     count = 0
 
     if mapping_provider is None:
@@ -585,6 +601,7 @@ def build_prompts(input_dirs, output_path, base_dir=".", struct_expand_depth=2,
                 continue
 
             module_info = analyze_module(full_dir, mapping_provider=mapping_provider)
+            helpers_db = build_helper_db(module_info)
             all_constants = parse_all_constants()
             var_decls = generate_sv_var_declarations(
                 module_info["structs"], module_info["module_type"],

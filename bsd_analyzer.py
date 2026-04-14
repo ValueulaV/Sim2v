@@ -105,6 +105,84 @@ def extract_methods(cpp_source, module_type):
     return methods
 
 
+def parse_module_member_helpers(cpp_source, module_type):
+    # 除了 util.h 里的 inline/helper 以外，项目里还有不少定义在
+    # `<Module>_cpp.h` 里的类成员辅助函数，例如 `get_latency()` /
+    # `apply_wakeup_to_uop()`。这些函数不会进入 translated method 列表，
+    # 但 prompt/read-set 推导仍然需要它们的源码。
+    helpers = {}
+    pattern = re.compile(
+        rf"((?:inline\s+)?[\w:<>~*&,\s]+\b{re.escape(module_type)}::(\w+)\s*\([^)]*\)\s*(?:const\s*)?\{{)",
+        re.DOTALL,
+    )
+    for match in pattern.finditer(cpp_source):
+        name = match.group(2)
+        if (
+            name == module_type
+            or name in ("seq", "out_initial_detect")
+            or name.startswith("pi_to_simulator")
+            or name.startswith("simulator_to_po")
+            or name == "simulator_with_bsd"
+            or name == "init"
+            or name.startswith("comb_")
+        ):
+            continue
+        body = _extract_braced_body(cpp_source, match.end())
+        helpers[name] = match.group(1) + "\n" + body.rstrip() + "\n}"
+    return helpers
+
+
+def build_helper_db(module_info):
+    helpers = parse_helper_functions()
+    helpers.update(parse_module_member_helpers(
+        module_info.get("logic_source", ""),
+        module_info["module_type"],
+    ))
+    return helpers
+
+
+def project_context_for_logic(logic_text):
+    # 只在 method 实际依赖项目级 constexpr 配置表时，把 config.h 片段送进上下文。
+    # 这样既避免 prompt 膨胀，也能覆盖 Isu::init 这类强依赖静态配置的函数。
+    logic_text = logic_text or ""
+    wants_iq = "GLOBAL_IQ_CONFIG" in logic_text
+    wants_ports = (
+        "GLOBAL_ISSUE_PORT_CONFIG" in logic_text
+        or "PORT_CFG" in logic_text
+        or "count_ports_with_mask" in logic_text
+        or "find_first_port_with_mask" in logic_text
+    )
+    if not (wants_iq or wants_ports):
+        return ""
+
+    config_path = os.path.join(SIMULATOR_INCLUDE, "config.h")
+    if not os.path.exists(config_path):
+        return ""
+
+    with open(config_path) as f:
+        content = f.read()
+
+    blocks = []
+    if wants_ports:
+        macro = re.search(r"^\s*#define\s+PORT_CFG\(mask\).*$", content, re.MULTILINE)
+        if macro:
+            blocks.append(macro.group(0).rstrip())
+        port_cfg = re.search(
+            r"constexpr\s+IssuePortConfigInfo\s+GLOBAL_ISSUE_PORT_CONFIG\s*\[\]\s*=\s*\{[\s\S]*?\};",
+            content,
+        )
+        if port_cfg:
+            blocks.append(port_cfg.group(0).strip())
+    if wants_iq:
+        iq_cfg = re.search(
+            r"constexpr\s+IQStaticConfig\s+GLOBAL_IQ_CONFIG\s*\[\]\s*=\s*\{[\s\S]*?\};",
+            content,
+        )
+        if iq_cfg:
+            blocks.append(iq_cfg.group(0).strip())
+    return "\n\n".join(block for block in blocks if block).strip()
+
+
 def _extract_braced_body(text, start):
     depth = 1
     i = start
