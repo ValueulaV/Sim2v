@@ -823,12 +823,34 @@ def get_struct_order_for_method(structs, module_type, method_body=None, expand_d
     return _topo_sort_structs(structs, selected)
 
 
+def _compact_record_source(source):
+    records = list(_iter_record_defs(source or ""))
+    if len(records) != 1:
+        return (source or "").strip()
+
+    record = records[0]
+    body = _prepare_record_body_for_fields(record["body"], record["name"]).strip()
+    body_lines = []
+    if body:
+        for line in body.splitlines():
+            body_lines.append(f"  {line.rstrip()}")
+    body_text = "\n".join(body_lines)
+
+    stripped = (source or "").lstrip()
+    if stripped.startswith("typedef struct"):
+        return f"typedef struct {{\n{body_text}\n}} {record['name']};".strip()
+    if stripped.startswith("class"):
+        class_body = "public:\n" + body_text if body_text else "public:"
+        return f"class {record['name']} {{\n{class_body}\n}};".strip()
+    return f"struct {record['name']} {{\n{body_text}\n}};".strip()
+
+
 def generate_cpp_type_sources(struct_sources, ordered_structs):
     parts = []
     for sname in ordered_structs:
         src = struct_sources.get(sname, "")
         if src:
-            parts.extend([src, ""])
+            parts.extend([_compact_record_source(src), ""])
     return "\n".join(parts).strip()
 
 

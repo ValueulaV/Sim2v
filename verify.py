@@ -4,6 +4,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
+import re
 import subprocess
 import tempfile
 
@@ -40,14 +41,22 @@ def verify(cpp_path, verilog_code, module_name, pi_width, po_width,
     exhaustive = pi_width <= exhaustive_threshold
     num_tests = (1 << pi_width) if exhaustive else max_test_vectors
 
-    # Auto-detect if bsd file (needs simulator_include)
+    # Auto-detect if the C++ reference depends on simulator headers.
+    # Snippet reference headers keep the original wrapper includes, so they may
+    # include module headers such as `Isu.h` even when they are not PRF/ROB.
     with open(cpp_path) as f:
         cpp_content = f.read()
-    needs_include = "<PRF.h>" in cpp_content or "<ROB.h>" in cpp_content
-    if needs_include and not extra_cflags:
-        extra_cflags = f"-I{SIMULATOR_INCLUDE}"
-    elif needs_include and f"-I{SIMULATOR_INCLUDE}" not in extra_cflags:
-        extra_cflags = f"{extra_cflags} -I{SIMULATOR_INCLUDE}".strip()
+    needs_include = (
+        re.search(r'#include\s+[<"]\w+\.h[>"]', cpp_content) is not None
+        or "<PRF.h>" in cpp_content
+        or "<ROB.h>" in cpp_content
+    )
+    if needs_include:
+        include_flag = f"-I{SIMULATOR_INCLUDE}"
+        if not extra_cflags:
+            extra_cflags = include_flag
+        elif include_flag not in extra_cflags:
+            extra_cflags = f"{extra_cflags} {include_flag}".strip()
 
     if artifact_dir:
         paths = _materialize_verification_artifacts(

@@ -614,11 +614,16 @@ def build_prompts(input_dirs, output_path, base_dir=".", struct_expand_depth=2,
                 method = ordered_methods.get(method_name)
                 if not method:
                     continue
+                method_helpers = extract_method_helpers(method["body"], helpers_db)
+                logic_text = method["body"] + "\n" + "\n".join(method_helpers.values())
+                method_expand_depth = struct_expand_depth
+                if module_info["module_type"] == "Isu":
+                    method_expand_depth = max(method_expand_depth, 3)
                 ordered = get_struct_order_for_method(
                     module_info["structs"],
                     module_info["module_type"],
-                    method_body=method["body"],
-                    expand_depth=struct_expand_depth,
+                    method_body=logic_text,
+                    expand_depth=method_expand_depth,
                 )
                 sv_typedefs = generate_sv_typedefs(
                     module_info["structs"], module_info["type_widths"],

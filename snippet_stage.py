@@ -384,13 +384,14 @@ def _build_method_context(module_info, combine_info, helper_db, all_constants):
         # method_ctx 则偏向单个 method 的最小可翻译环境。
         method_helpers = bsd_analyzer.extract_method_helpers(method["body"], helper_db)
         logic_text = method["body"] + "\n" + "\n".join(method_helpers.values())
+        expand_depth = 3 if module_info["module_type"] == "Isu" else 1
         used_consts = prompt_builder.select_prompt_constants(all_constants, logic_text)
         project_context = bsd_analyzer.project_context_for_logic(logic_text)
         order = bsd_analyzer.get_struct_order_for_method(
             module_info["structs"],
             module_info["module_type"],
-            method_body=method["body"],
-            expand_depth=1,
+            method_body=logic_text,
+            expand_depth=expand_depth,
         )
         contexts[method["name"]] = {
             "helpers": method_helpers,
@@ -400,8 +401,8 @@ def _build_method_context(module_info, combine_info, helper_db, all_constants):
                 module_info["structs"],
                 module_info["type_widths"],
                 module_type=module_info["module_type"],
-                method_body=method["body"],
-                expand_depth=1,
+                method_body=logic_text,
+                expand_depth=expand_depth,
             ),
             "project_context": project_context,
             "var_decls": combine_info["var_decls"],

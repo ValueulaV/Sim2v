@@ -400,6 +400,23 @@ def _debug_extra_hint(verify_message):
             "Do not try to fix this by adding constants. Rewrite it as a constant-bound loop "
             "over the full legal range, then guard the body with `if (...)`."
         )
+    if "Index in generate block prefix syntax is not constant" in msg:
+        return (
+            "The snippet is still using direct dynamic field access such as `arr[idx].field`. "
+            "For arrays of structs or packed aggregates, first read/write the whole element through a temporary "
+            "(`tmp = arr[idx]; tmp.field = ...; arr[idx] = tmp;`)."
+        )
+    if "Member '" in msg and "not found in structure" in msg:
+        return (
+            "The snippet is using a field name that does not exist in the declared packed struct. "
+            "Do not infer container internals from the C++ class API. Use only fields that appear in the provided "
+            "SystemVerilog typedefs, or inline the method behavior with those real fields."
+        )
+    if "WIDTHTRUNC" in msg or "WIDTHEXPAND" in msg or "SELRANGE" in msg:
+        return (
+            "A width mismatch remains. Match the destination width explicitly: use same-width temporaries, "
+            "slices, masks, or zero/sign extension. Avoid assigning 32-bit arithmetic results directly into narrow fields."
+        )
     return "(none)"
 
 
@@ -1301,9 +1318,15 @@ def _sv_signal_expr(expr):
 
 def _sv_array_index_expr(expr, width=None):
     out = _sv_signal_expr(expr)
-    if not width:
+    if not width or re.fullmatch(r"\d+", out):
         return out
-    return f"{width}'(({out}))"
+    # Sized cast syntax like `3'((idx))` is not a legal SystemVerilog value cast
+    # and shows up in generated pi-unpack statements. A mask keeps the index within
+    # range while staying yosys/verilator-friendly.
+    if width >= 63:
+        return f"({out})"
+    mask = (1 << width) - 1
+    return f"(({out}) & {width}'h{mask:x})"
 
 
 def _sv_packed_offset_expr(expr):
@@ -1409,10 +1432,22 @@ def _build_sv_input_unpack(input_plan):
 def _build_cpp_input_unpack(input_plan):
     # C++ 参考壳与 SV wrapper 必须使用完全对称的输入解包逻辑，
     # 否则 snippet 对拍结果没有意义。
-    lines = [
-        f"    {leaf['cpp_expr']} = static_cast<uint64_t>(snippet_read_bits(pi, cursor, {leaf['width']}));"
-        for leaf in input_plan["leaves"]
-    ]
+    lines = []
+    for leaf in input_plan["leaves"]:
+        width = int(leaf["width"])
+        if width <= 1:
+            cast_type = "bool"
+        elif width <= 8:
+            cast_type = "uint8_t"
+        elif width <= 16:
+            cast_type = "uint16_t"
+        elif width <= 32:
+            cast_type = "uint32_t"
+        else:
+            cast_type = "uint64_t"
+        lines.append(
+            f"    {leaf['cpp_expr']} = static_cast<{cast_type}>(snippet_read_bits(pi, cursor, {width}));"
+        )
     return "\n".join(lines) if lines else "    // (no free inputs)"
 
 

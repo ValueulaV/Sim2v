@@ -28,6 +28,62 @@ SIMULATOR_INCLUDE = os.path.join(
 )
 
 
+def _find_matching_brace_end(text, open_idx):
+    depth = 1
+    i = open_idx + 1
+    in_line_comment = False
+    in_block_comment = False
+    in_string = None
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if in_string:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == in_string:
+                in_string = None
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch in ('"', "'"):
+            in_string = ch
+            i += 1
+            continue
+
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
 def analyze_module(bsd_dir, module_type=None, mapping_provider=None):
     # analyze_module 是“模块静态信息收集”的总入口。
     # 目标不是做完整 C++ 语义分析，而是给后续阶段提供一份足够稳定的中间表示：
@@ -132,12 +188,84 @@ def parse_module_member_helpers(cpp_source, module_type):
     return helpers
 
 
+def parse_header_inline_helpers(header_name):
+    path = os.path.join(SIMULATOR_INCLUDE, header_name)
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        content = f.read()
+
+    helpers = {}
+    record_defs = {}
+    for record in re.finditer(r"(struct|class)\s+(\w+)\s*\{", content):
+        name = record.group(2)
+        open_idx = content.find("{", record.start(), record.end())
+        close_idx = _find_matching_brace_end(content, open_idx)
+        if close_idx < 0:
+            continue
+        record_defs[name] = content[open_idx + 1:close_idx]
+
+    method_pat = re.compile(
+        r"((?:inline\s+)?[\w:<>~*&,\s]+\b(\w+)::(\w+)\s*\([^)]*\)\s*(?:const\s*)?\{)",
+        re.DOTALL,
+    )
+    for match in method_pat.finditer(content):
+        owner = match.group(2)
+        name = match.group(3)
+        body = _extract_braced_body(content, match.end())
+        helpers[name] = match.group(1) + "\n" + body.rstrip() + "\n}"
+
+    for owner, body in record_defs.items():
+        pos = 0
+        while pos < len(body):
+            open_idx = body.find("{", pos)
+            if open_idx < 0:
+                break
+            header = body[pos:open_idx].strip()
+            semi_idx = header.rfind(";")
+            if semi_idx >= 0:
+                header = header[semi_idx + 1:].strip()
+            colon_idx = header.rfind("public:")
+            if colon_idx >= 0:
+                header = header[colon_idx + len("public:"):].strip()
+            colon_idx = header.rfind("private:")
+            if colon_idx >= 0:
+                header = header[colon_idx + len("private:"):].strip()
+            colon_idx = header.rfind("protected:")
+            if colon_idx >= 0:
+                header = header[colon_idx + len("protected:"):].strip()
+
+            name_match = re.search(r"([~]?\w+)\s*\([^()]*\)\s*(?:const\s*)?(?::[\s\S]*)?$", header, re.DOTALL)
+            if not name_match:
+                pos = open_idx + 1
+                continue
+            name = name_match.group(1)
+            if name == owner or name.startswith("~"):
+                close_idx = _find_matching_brace_end(body, open_idx)
+                pos = close_idx + 1 if close_idx >= 0 else open_idx + 1
+                continue
+            prefix = header[:name_match.start(1)].strip()
+            if not prefix and name == owner:
+                close_idx = _find_matching_brace_end(body, open_idx)
+                pos = close_idx + 1 if close_idx >= 0 else open_idx + 1
+                continue
+            close_idx = _find_matching_brace_end(body, open_idx)
+            if close_idx < 0:
+                break
+            method_body = body[open_idx + 1:close_idx]
+            helpers.setdefault(name, header + " {\n" + method_body.rstrip() + "\n}")
+            pos = close_idx + 1
+    return helpers
+
+
 def build_helper_db(module_info):
     helpers = parse_helper_functions()
     helpers.update(parse_module_member_helpers(
         module_info.get("logic_source", ""),
         module_info["module_type"],
     ))
+    if module_info.get("module_type") == "Isu":
+        helpers.update(parse_header_inline_helpers("IssueQueue.h"))
     return helpers
 
 
