@@ -27,10 +27,10 @@ def _extract_braced_body(text, start):
 
 
 def _try_eval_const_expr(expr, known_constants):
-    expr = expr.strip()
+    expr = _normalize_const_expr(expr)
     if not expr:
         return None
-    if re.fullmatch(r"\d+", expr):
+    if re.fullmatch(r"-?\d+", expr):
         return int(expr)
     try:
         val = eval(expr, {"__builtins__": {}}, known_constants)
@@ -43,27 +43,140 @@ def _try_eval_const_expr(expr, known_constants):
     return None
 
 
-def _load_known_constants():
-    # 当前版本只从 config.h 读取全局常量。
-    # 这是实现层面的取舍：足够支撑 PRF/ROB，但并不是完整的 C/C++ 常量系统。
-    config_path = os.path.join(SIMULATOR_INCLUDE, "config.h")
-    if not os.path.exists(config_path):
-        return {}
+def _strip_comments(text):
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    return re.sub(r"//.*", "", text)
 
-    with open(config_path) as f:
-        content = f.read()
 
-    known = {}
+def _normalize_const_expr(expr):
+    expr = expr.strip()
+    if not expr:
+        return expr
+    expr = re.sub(r"\b(?:static_cast|reinterpret_cast|const_cast|dynamic_cast)\s*<[^>]+>\s*\(([^()]+)\)", r"(\1)", expr)
+    expr = re.sub(r"\b\w+::", "", expr)
+    expr = re.sub(r"\btrue\b", "True", expr)
+    expr = re.sub(r"\bfalse\b", "False", expr)
+    expr = expr.replace("&&", " and ")
+    expr = expr.replace("||", " or ")
+    expr = re.sub(r"(?<![<>=!])!(?!=)", " not ", expr)
+    expr = re.sub(
+        r"\b(0[xX][0-9a-fA-F]+|0[bB][01]+|\d+)([uU](?:[lL]{1,2})?|[lL]{1,2}[uU]?)\b",
+        r"\1",
+        expr,
+    )
+    return " ".join(expr.split())
+
+
+def _split_top_level(text, sep=","):
+    parts = []
+    buf = []
+    depth_paren = 0
+    depth_brace = 0
+    depth_bracket = 0
+    depth_angle = 0
+    for ch in text:
+        if ch == "(":
+            depth_paren += 1
+        elif ch == ")":
+            depth_paren = max(0, depth_paren - 1)
+        elif ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            depth_brace = max(0, depth_brace - 1)
+        elif ch == "[":
+            depth_bracket += 1
+        elif ch == "]":
+            depth_bracket = max(0, depth_bracket - 1)
+        elif ch == "<":
+            depth_angle += 1
+        elif ch == ">":
+            depth_angle = max(0, depth_angle - 1)
+
+        if ch == sep and all(d == 0 for d in (depth_paren, depth_brace, depth_bracket, depth_angle)):
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+            continue
+        buf.append(ch)
+
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _extract_brace_groups(text):
+    groups = []
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i + 1
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                groups.append(text[start:i].strip())
+                start = None
+    return groups
+
+
+def _parse_enum_constants(text, known):
+    for m in re.finditer(r"enum(?:\s+class)?(?:\s+\w+)?(?:\s*:\s*\w+)?\s*\{(.*?)\}\s*;", text, re.DOTALL):
+        current = -1
+        for item in _split_top_level(m.group(1)):
+            if not item:
+                continue
+            if "=" in item:
+                name, expr = item.split("=", 1)
+                name = name.strip()
+                val = _try_eval_const_expr(expr.strip(), known)
+                if val is None:
+                    continue
+                current = val
+                known[name] = val
+            else:
+                name = item.strip()
+                if not re.fullmatch(r"[A-Za-z_]\w*", name):
+                    continue
+                current += 1
+                known[name] = current
+
+
+def _parse_object_like_macros(text):
     raw_defs = {}
-    for m in re.finditer(r'#define\s+([A-Z_]\w*)\s+(.+)', content):
+    for m in re.finditer(r"^\s*#define\s+([A-Z_]\w*)\s*(.*)$", text, re.MULTILINE):
         name = m.group(1)
-        expr = m.group(2).split("//")[0].strip()
+        expr = m.group(2).strip()
         if not expr or "(" in name:
             continue
         if any(t in expr for t in ['"', "'", "{", "}"]):
             continue
         raw_defs[name] = expr
+    return raw_defs
 
+
+def _parse_constexpr_scalars(text):
+    raw_defs = {}
+    pat = re.compile(
+        r"constexpr\s+[^;{}=]+?\s+([A-Za-z_]\w*)\s*(\[[^\]]*\])?\s*=\s*(.*?);",
+        re.DOTALL,
+    )
+    for m in pat.finditer(text):
+        name = m.group(1)
+        array_suffix = m.group(2)
+        expr = m.group(3).strip()
+        if array_suffix:
+            continue
+        if any(t in expr for t in ['"', "'", "{", "}"]):
+            continue
+        raw_defs[name] = expr
+    return raw_defs
+
+
+def _resolve_raw_definitions(raw_defs, known):
     unresolved = dict(raw_defs)
     changed = True
     while unresolved and changed:
@@ -74,6 +187,157 @@ def _load_known_constants():
                 known[name] = val
                 unresolved.pop(name)
                 changed = True
+    return unresolved
+
+
+def _extract_project_issue_port_configs(text, known):
+    m = re.search(
+        r"constexpr\s+IssuePortConfigInfo\s+GLOBAL_ISSUE_PORT_CONFIG\s*\[\]\s*=\s*\{(.*?)\};",
+        text,
+        re.DOTALL,
+    )
+    if not m:
+        return []
+
+    configs = []
+    for idx, item in enumerate(_split_top_level(m.group(1))):
+        mask_expr = None
+        port_cfg = re.fullmatch(r"PORT_CFG\s*\((.*)\)", item, re.DOTALL)
+        if port_cfg:
+            mask_expr = port_cfg.group(1).strip()
+        else:
+            fields = _split_top_level(item.strip().strip("{}"))
+            if len(fields) >= 2:
+                mask_expr = fields[1]
+        if mask_expr is None:
+            continue
+        mask_val = _try_eval_const_expr(mask_expr, known)
+        if mask_val is None:
+            continue
+        configs.append({"port_idx": idx, "support_mask": mask_val})
+    return configs
+
+
+def _extract_project_iq_configs(text, known):
+    m = re.search(
+        r"constexpr\s+IQStaticConfig\s+GLOBAL_IQ_CONFIG\s*\[\]\s*=\s*\{(.*?)\};",
+        text,
+        re.DOTALL,
+    )
+    if not m:
+        return []
+
+    configs = []
+    for group in _extract_brace_groups(m.group(1)):
+        fields = _split_top_level(group)
+        if len(fields) != 6:
+            continue
+        values = []
+        for field in fields:
+            val = _try_eval_const_expr(field, known)
+            if val is None:
+                values = []
+                break
+            values.append(val)
+        if values:
+            configs.append({
+                "id": values[0],
+                "size": values[1],
+                "dispatch_width": values[2],
+                "supported_ops": values[3],
+                "port_start_idx": values[4],
+                "port_num": values[5],
+            })
+    return configs
+
+
+def _load_known_constants():
+    # 当前实现仍然不是完整的 C/C++ 常量求值器，但会覆盖 simulator_include
+    # 里实际依赖到的 object-like #define、enum、constexpr 标量和少量配置表推导。
+    header_names = ["base_types.h", "config.h", "types.h"]
+    contents = []
+    for fname in header_names:
+        path = os.path.join(SIMULATOR_INCLUDE, fname)
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            contents.append(_strip_comments(f.read()))
+    if not contents:
+        return {}
+
+    combined = "\n".join(contents)
+
+    def _clog2(n):
+        res = 0
+        while n > (1 << res):
+            res += 1
+        return res
+
+    def _bit_width_for_count(count):
+        width = 0
+        max_value = count - 1 if count > 0 else 0
+        while True:
+            width += 1
+            max_value >>= 1
+            if max_value == 0:
+                return width
+
+    def _is_power_of_two_u64(n):
+        return n != 0 and (n & (n - 1)) == 0
+
+    known = {
+        "clog2": _clog2,
+        "bit_width_for_count": _bit_width_for_count,
+        "is_power_of_two_u64": _is_power_of_two_u64,
+    }
+
+    _parse_enum_constants(combined, known)
+
+    raw_defs = {}
+    raw_defs.update(_parse_object_like_macros(combined))
+    raw_defs.update(_parse_constexpr_scalars(combined))
+    _resolve_raw_definitions(raw_defs, known)
+
+    issue_port_configs = _extract_project_issue_port_configs(combined, known)
+    if issue_port_configs:
+        known["ISSUE_WIDTH"] = len(issue_port_configs)
+
+        def _count_ports_with_mask(mask):
+            return sum(1 for cfg in issue_port_configs if cfg["support_mask"] & mask)
+
+        def _find_first_port_with_mask(mask):
+            for cfg in issue_port_configs:
+                if cfg["support_mask"] & mask:
+                    return cfg["port_idx"]
+            return -1
+
+        known["count_ports_with_mask"] = _count_ports_with_mask
+        known["find_first_port_with_mask"] = _find_first_port_with_mask
+        _resolve_raw_definitions(raw_defs, known)
+
+        major_masks = [
+            known.get("OP_MASK_ALU"),
+            known.get("OP_MASK_CSR"),
+            known.get("OP_MASK_MUL"),
+            known.get("OP_MASK_DIV"),
+            known.get("OP_MASK_BR"),
+            known.get("OP_MASK_LD"),
+            known.get("OP_MASK_STA"),
+            known.get("OP_MASK_STD"),
+            known.get("OP_MASK_FP"),
+        ]
+        major_masks = [m for m in major_masks if isinstance(m, int)]
+        if major_masks and "TOTAL_FU_COUNT" not in known:
+            known["TOTAL_FU_COUNT"] = sum(
+                sum(1 for mask in major_masks if cfg["support_mask"] & mask)
+                for cfg in issue_port_configs
+            )
+
+    iq_configs = _extract_project_iq_configs(combined, known)
+    if iq_configs and "MAX_IQ_SIZE" not in known:
+        known["MAX_IQ_SIZE"] = max(cfg["size"] for cfg in iq_configs)
+        _resolve_raw_definitions(raw_defs, known)
+
     return known
 
 
