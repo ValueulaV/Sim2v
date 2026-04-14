@@ -15,15 +15,66 @@ SIMULATOR_INCLUDE = os.path.join(
 
 
 def _extract_braced_body(text, start):
+    close_idx = _find_matching_brace_end(text, start - 1)
+    if close_idx < 0:
+        return text[start:].strip()
+    return text[start:close_idx].strip()
+
+
+def _find_matching_brace_end(text, open_idx):
     depth = 1
-    i = start
-    while i < len(text) and depth > 0:
-        if text[i] == "{":
+    i = open_idx + 1
+    in_line_comment = False
+    in_block_comment = False
+    in_string = None
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if in_string:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == in_string:
+                in_string = None
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch in ('"', "'"):
+            in_string = ch
+            i += 1
+            continue
+
+        if ch == "{":
             depth += 1
-        elif text[i] == "}":
+        elif ch == "}":
             depth -= 1
+            if depth == 0:
+                return i
         i += 1
-    return text[start:i - 1].strip()
+    return -1
 
 
 def _try_eval_const_expr(expr, known_constants):
@@ -374,6 +425,117 @@ def parse_all_structs():
     return type_widths, structs, struct_sources
 
 
+def _iter_record_defs(text):
+    record_pat = re.compile(
+        r"typedef\s+struct(?:\s+\w+)?\s*\{"
+        r"|struct\s+(\w+)\s*\{"
+        r"|class\s+(\w+)\s*\{",
+        re.DOTALL,
+    )
+    pos = 0
+    while True:
+        m = record_pat.search(text, pos)
+        if not m:
+            break
+
+        open_idx = text.find("{", m.start(), m.end())
+        if open_idx < 0:
+            pos = m.end()
+            continue
+        close_idx = _find_matching_brace_end(text, open_idx)
+        if close_idx < 0:
+            pos = m.end()
+            continue
+
+        if text[m.start():m.end()].lstrip().startswith("typedef struct"):
+            alias_match = re.match(r"\s*(\w+)\s*;", text[close_idx + 1:])
+            if not alias_match:
+                pos = close_idx + 1
+                continue
+            name = alias_match.group(1)
+            end_idx = close_idx + 1 + alias_match.end()
+        else:
+            name = m.group(1) or m.group(2)
+            semi_match = re.match(r"\s*;", text[close_idx + 1:])
+            end_idx = close_idx + 1 + semi_match.end() if semi_match else close_idx + 1
+
+        body = text[open_idx + 1:close_idx]
+        source = text[m.start():end_idx].strip()
+        yield {
+            "name": name,
+            "body": body,
+            "source": source,
+        }
+        pos = end_idx
+
+
+def _remove_text_spans(text, spans):
+    if not spans:
+        return text
+    parts = []
+    cursor = 0
+    for start, end in sorted(spans):
+        parts.append(text[cursor:start])
+        cursor = max(cursor, end)
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def _strip_nested_record_defs(body):
+    spans = []
+    for record in _iter_record_defs(body):
+        source = record["source"]
+        start = body.find(source)
+        if start >= 0:
+            spans.append((start, start + len(source)))
+    return _remove_text_spans(body, spans)
+
+
+def _looks_like_method_start(line, record_name=None):
+    line = line.strip()
+    if not line or line.startswith("//"):
+        return False
+    if line in ("public:", "private:", "protected:"):
+        return False
+    if re.match(r"(?:if|for|while|switch)\s*\(", line):
+        return False
+    if record_name and re.match(rf"(?:explicit\s+)?~?{re.escape(record_name)}\s*\(", line):
+        return True
+    return bool(re.match(r"(?:static\s+)?(?:inline\s+)?[\w:<>~*&,\s]+\s+\w+\s*\(", line))
+
+
+def _prepare_record_body_for_fields(body, record_name=None):
+    body = _strip_nested_record_defs(body)
+    lines = []
+    for raw in body.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        if line in ("public:", "private:", "protected:"):
+            continue
+        if _looks_like_method_start(line, record_name):
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _normalize_cpp_type_name(type_name):
+    type_name = re.sub(r"\bconst\b", "", type_name)
+    type_name = re.sub(r"\s+", " ", type_name).strip()
+    vector_match = re.fullmatch(r"(?:std::)?vector\s*<\s*(.+)\s*>", type_name)
+    if vector_match:
+        return _normalize_cpp_type_name(vector_match.group(1))
+    return type_name.split("::")[-1].strip()
+
+
+def _infer_field_width(type_name, type_widths):
+    norm = _normalize_cpp_type_name(type_name)
+    bit_type = re.fullmatch(r"(?:wire|reg)\s*<\s*([^>]+)\s*>", norm)
+    if bit_type:
+        return _try_eval_const_expr(bit_type.group(1), KNOWN_CONSTANTS)
+    return type_widths.get(norm)
+
+
 def _parse_file_structs(content, existing_type_widths=None):
     # 先解析 primitive typedef 宽度，再解析 struct/class 字段。
     # 顺序很重要：后续字段如果引用了前面定义的 alias，需要先把位宽表建起来。
@@ -383,11 +545,18 @@ def _parse_file_structs(content, existing_type_widths=None):
 
     prim_widths = {
         "bool": 1,
+        "char": 8,
+        "int": 32,
+        "int32_t": 32,
+        "int64_t": 64,
         "uint8_t": 8,
         "uint16_t": 16,
         "uint32_t": 32,
         "uint64_t": 64,
     }
+    for name, width in prim_widths.items():
+        type_widths.setdefault(name, width)
+
     for m in re.finditer(r"typedef\s+(\w+)\s+(\w+)\s*;", content):
         base_type, alias = m.group(1), m.group(2)
         if base_type in prim_widths:
@@ -396,23 +565,17 @@ def _parse_file_structs(content, existing_type_widths=None):
         elif base_type in type_widths:
             type_widths[alias] = type_widths[base_type]
 
-    struct_pat = re.compile(r"typedef\s+struct\s*(?:\w+)?\s*\{([^}]*)\}\s*(\w+)\s*;", re.DOTALL)
-    for m in struct_pat.finditer(content):
-        body, name = m.group(1), m.group(2)
-        fields = _parse_struct_fields(body, type_widths)
-        structs[name] = fields
-        struct_sources[name] = m.group(0).strip()
+    for record in _iter_record_defs(content):
+        nested_tw, nested_structs, nested_sources = _parse_file_structs(record["body"], type_widths)
+        type_widths.update(nested_tw)
+        structs.update(nested_structs)
+        struct_sources.update(nested_sources)
 
-    class_pat = re.compile(r"class\s+(\w+)\s*\{([\s\S]*?)\}\s*;", re.DOTALL)
-    for m in class_pat.finditer(content):
-        name, body = m.group(1), m.group(2)
-        body = re.sub(r"public:|private:|protected:", "", body)
-        lines = [line for line in body.split("\n") if "(" not in line and line.strip()]
-        cleaned = "\n".join(lines)
+        cleaned = _prepare_record_body_for_fields(record["body"], record["name"])
         fields = _parse_struct_fields(cleaned, type_widths)
         if fields:
-            structs[name] = fields
-            struct_sources[name] = m.group(0).strip()
+            structs[record["name"]] = fields
+            struct_sources[record["name"]] = record["source"]
 
     return type_widths, structs, struct_sources
 
@@ -425,16 +588,15 @@ def _parse_struct_fields(body, type_widths):
         line = raw.strip()
         if not line or line.startswith("//") or line.startswith("#"):
             continue
+        if line.startswith(("return ", "if ", "for ", "while ", "switch ", "else", "break", "continue")):
+            continue
 
-        m = re.match(r"(\w+)\s+(.+);", line)
+        m = re.match(r"([~\w:<>]+(?:\s*<[^;]+?>)?)\s+(.+);", line)
         if not m:
             continue
-        type_name = m.group(1)
+        raw_type_name = m.group(1).strip()
+        type_name = _normalize_cpp_type_name(raw_type_name)
         rest = m.group(2).strip()
-
-        if type_name in ("int64_t", "int", "int32_t", "uint64_t", "uint32_t", "uint16_t", "uint8_t", "char"):
-            if type_name not in type_widths:
-                continue
 
         for part in rest.split(","):
             part = re.sub(r"^\*\s*", "", part.strip())
@@ -457,7 +619,7 @@ def _parse_struct_fields(body, type_widths):
                 if not re.match(r"^\w+$", fname):
                     continue
                 array_dims = None
-            width = type_widths.get(type_name)
+            width = _infer_field_width(raw_type_name, type_widths)
             fields.append({
                 "name": fname,
                 "type": type_name,
@@ -474,7 +636,7 @@ def _validate_signal_paths(outputs, structs, type_widths, module_type):
     for out in outputs:
         path = out["path"]
         clean = re.sub(r"^\w+\.(out|in)\.", "", path).replace("->", ".")
-        parts = [re.sub(r"\[\w+\]", "", part) for part in clean.split(".")]
+        parts = [re.sub(r"\[[^\]]+\]", "", part) for part in clean.split(".")]
         leaf = parts[-1]
         if leaf not in all_field_names and leaf not in type_widths:
             errors.append(f"Unknown leaf field '{leaf}' in: {path}")
