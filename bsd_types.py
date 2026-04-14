@@ -859,8 +859,9 @@ def generate_sv_typedefs(structs, type_widths, module_type=None, method_body=Non
             if sv_type is None:
                 continue
             fname = escape_sv_keyword(field["name"])
-            packed_dims = _format_sv_packed_dims(field.get("array_dims"))
-            field_lines.append(f"    {sv_type}{packed_dims} {fname};")
+            field_lines.append(
+                f"    {_attach_packed_dims_to_sv_type(sv_type, field.get('array_dims'))} {fname};"
+            )
         if field_lines:
             lines.append("typedef struct packed {")
             lines.extend(field_lines)
@@ -879,6 +880,16 @@ def _format_sv_packed_dims(dims):
     if not dims:
         return ""
     return "".join(f" [{dim - 1}:0]" for dim in dims)
+
+
+def _attach_packed_dims_to_sv_type(sv_type, dims):
+    if not dims:
+        return sv_type
+    packed_dims = _format_sv_packed_dims(dims)
+    if sv_type.startswith("logic"):
+        suffix = sv_type[len("logic"):]
+        return f"logic{packed_dims}{suffix}"
+    return f"{sv_type}{packed_dims}"
 
 
 def _module_interface_type(structs, module_type, field_name):

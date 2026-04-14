@@ -583,17 +583,10 @@ def _project_specific_io_hints(module_info, method_name):
                 "out.iss_awake.wake.preg",
                 "iqs[i].count_1",
                 "iqs[i].size",
-                "iqs[i].entry_1.valid",
             ],
             [
                 "iqs[i].count_1",
                 "iqs[i].entry_1.valid",
-                "iqs[i].entry_1.uop.dest_preg",
-                "iqs[i].entry_1.uop.src1_preg",
-                "iqs[i].entry_1.uop.src2_preg",
-                "iqs[i].entry_1.uop.src1_busy",
-                "iqs[i].entry_1.uop.src2_busy",
-                "iqs[i].entry_1.uop.op",
             ],
         ),
         "comb_flush": (

@@ -46,6 +46,8 @@ def verify(cpp_path, verilog_code, module_name, pi_width, po_width,
     needs_include = "<PRF.h>" in cpp_content or "<ROB.h>" in cpp_content
     if needs_include and not extra_cflags:
         extra_cflags = f"-I{SIMULATOR_INCLUDE}"
+    elif needs_include and f"-I{SIMULATOR_INCLUDE}" not in extra_cflags:
+        extra_cflags = f"{extra_cflags} -I{SIMULATOR_INCLUDE}".strip()
 
     if artifact_dir:
         paths = _materialize_verification_artifacts(
