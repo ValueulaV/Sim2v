@@ -1,7 +1,7 @@
 # sim2v configuration
 
-verilator: /workspace/S/mazhewei/miniconda3/envs/sim2v/bin/verilator
-yosys: /workspace/S/mazhewei/miniconda3/envs/sim2v/bin/yosys
+verilator: ~/uv-venv/sim2v/lib/python3.12/site-packages/verilator/bin/verilator
+yosys: /opt/homebrew/Cellar/yosys/0.64/bin/yosys
 
 llm:
   model: claude-sonnet-4-6
