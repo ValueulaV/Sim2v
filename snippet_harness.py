@@ -539,6 +539,19 @@ def _root_signal_names(module_info):
     }
 
 
+def _module_interface_type(module_info, field_name):
+    for field in module_info["structs"].get(module_info["module_type"], []):
+        if field["name"] == field_name:
+            return field.get("type")
+    legacy = f"{module_info['module_type']}_{field_name.upper()}"
+    if legacy in module_info["structs"]:
+        return legacy
+    camel = f"{module_info['module_type']}{field_name.capitalize()}"
+    if camel in module_info["structs"]:
+        return camel
+    return None
+
+
 def _order_signal_leaves_by_dependency(leaves):
     # compare_plan 里的叶子信号有时会互相依赖，例如某个数组索引本身就是另一个信号。
     # 这里做一个轻量的拓扑排序，尽量保证“先解依赖、后用依赖”。
@@ -593,7 +606,9 @@ def _build_roots(module_info, instance_name):
     # 后面的路径展开都建立在这份“根节点表”上。
     roots = {}
     structs = module_info["structs"]
-    for field in structs.get(f"{module_info['module_type']}_IN", []):
+    in_type = _module_interface_type(module_info, "in")
+    out_type = _module_interface_type(module_info, "out")
+    for field in structs.get(in_type, []):
         key = f"in.{field['name']}"
         roots[key] = {
             "type": field.get("type"),
@@ -604,7 +619,7 @@ def _build_roots(module_info, instance_name):
             "label": key,
             "child_sep": "->",
         }
-    for field in structs.get(f"{module_info['module_type']}_OUT", []):
+    for field in structs.get(out_type, []):
         key = f"out.{field['name']}"
         roots[key] = {
             "type": field.get("type"),
@@ -996,7 +1011,10 @@ def _strip_all_indices(token):
 
 def _runtime_index_ids(module_info):
     ids = set(_root_signal_names(module_info))
-    for cls_name in (f"{module_info['module_type']}_IN", f"{module_info['module_type']}_OUT"):
+    for cls_name in (
+        _module_interface_type(module_info, "in"),
+        _module_interface_type(module_info, "out"),
+    ):
         for field in module_info["structs"].get(cls_name, []):
             ids.add(f"in_{escape_sv_keyword(field['name'])}")
             ids.add(f"out_{escape_sv_keyword(field['name'])}")

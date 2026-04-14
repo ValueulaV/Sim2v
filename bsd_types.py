@@ -861,14 +861,27 @@ def _format_sv_packed_dims(dims):
     return "".join(f" [{dim - 1}:0]" for dim in dims)
 
 
+def _module_interface_type(structs, module_type, field_name):
+    for field in structs.get(module_type, []):
+        if field["name"] == field_name:
+            return field.get("type")
+    legacy = f"{module_type}_{field_name.upper()}"
+    if legacy in structs:
+        return legacy
+    camel = f"{module_type}{field_name.capitalize()}"
+    if camel in structs:
+        return camel
+    return None
+
+
 def generate_sv_var_declarations(structs, module_type):
     # 顶层变量声明分成三组返回：
     # - 输入根信号
     # - 输出根信号
     # - 模块内部状态
     # 后续 prompt、snippet wrapper、combine 都按这个分组使用。
-    in_class = f"{module_type}_IN"
-    out_class = f"{module_type}_OUT"
+    in_class = _module_interface_type(structs, module_type, "in")
+    out_class = _module_interface_type(structs, module_type, "out")
 
     def decls_for_class(cls_name, prefix):
         decls = []
@@ -905,9 +918,9 @@ def _build_root_var_type_map(structs, module_type):
     def add_var(name, finfo):
         roots[name] = {"type": finfo.get("type"), "width": finfo.get("width")}
 
-    for field in structs.get(f"{module_type}_IN", []):
+    for field in structs.get(_module_interface_type(structs, module_type, "in"), []):
         add_var(f"in_{escape_sv_keyword(field['name'])}", field)
-    for field in structs.get(f"{module_type}_OUT", []):
+    for field in structs.get(_module_interface_type(structs, module_type, "out"), []):
         add_var(f"out_{escape_sv_keyword(field['name'])}", field)
     for field in structs.get(module_type, []):
         if field["name"] not in ("in", "out"):
