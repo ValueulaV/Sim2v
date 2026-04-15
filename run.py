@@ -303,6 +303,7 @@ def cmd_verify(cfg, logger, run_dir, target=None):
                 verilator_bin=cfg["verilator"],
                 yosys_bin=cfg.get("yosys"),
                 parallel_jobs=vcfg.get("parallel_jobs", 1),
+                yosys_timeout_s=vcfg.get("yosys_timeout_s", 600),
             )
             tag = "PASS" if passed else "FAIL"
             logger.info(f"  {tag}: {msg}")

@@ -29,6 +29,7 @@ Hard rules:
 - Do NOT wrap the whole answer with a top-level `begin/end`.
 - You MAY declare local variables, but initialize them unconditionally.
 - If you declare locals, place all declarations before any executable statements in the block.
+- Do not declare array-typed locals (packed or unpacked) inside this method body.
 - Do not create extra named blocks such as `begin : helper_locals`.
 - Do not declare unpacked-array locals inside procedural code.
 - If a translated C++ local would otherwise be used after conditional assignment, give it an explicit safe default.
@@ -60,6 +61,10 @@ Hard rules:
   - Read: `tmp = arr[idx]; x = tmp.field;`
   - Write: `tmp = arr[idx]; tmp.field = ...; arr[idx] = tmp;`
   - Or use constant-bound loops / case statements that select whole elements, then access fields on the selected temporary.
+- For multi-dimensional aggregate arrays, never write `arr[i][j].field` directly.
+  First move `arr[i][j]` into a typed temporary, then access fields on that temporary.
+- Never duplicate the mapped container name after `in_*/out_*`.
+  Example: use `out_iss2dis.ready_num[i]`, never `out_iss2dis.iss2dis.ready_num[i]`.
 - Yosys requires procedural `for` loops to have compile-time-constant init/condition/step expressions.
   If the C++ loop start/end depends on a runtime signal, rewrite it as a constant-bound loop and
   guard the body with `if (...)` instead of putting the runtime expression directly in the loop header.
@@ -394,6 +399,18 @@ def build_debug_prompt(*, module_info, method, method_ctx, input_plan, compare_p
 
 def _debug_extra_hint(verify_message):
     msg = verify_message or ""
+    if "syntax error, unexpected '.'" in msg:
+        return (
+            "There is likely an invalid dotted access. Check for duplicated container names "
+            "after mapping (`out_iss2dis.iss2dis...` is invalid), and avoid direct chained access "
+            "like `arr[i][j].field`; use a typed temporary for `arr[i][j]` first."
+        )
+    if "Failed to detect width of signal access" in msg:
+        return (
+            "Yosys cannot infer width for this access pattern. Avoid local array-typed temporaries "
+            "inside the method body, and avoid dynamic chained field access on aggregates. "
+            "Use scalar temporaries or existing framework-declared arrays/structs."
+        )
     if "procedural for-loop" in msg and "not constant" in msg:
         return (
             "The failing `for` loop header contains a runtime-dependent expression. "

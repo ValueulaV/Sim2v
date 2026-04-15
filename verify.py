@@ -28,7 +28,7 @@ def _normalize_tool_path(path):
 def verify(cpp_path, verilog_code, module_name, pi_width, po_width,
            exhaustive_threshold=20, max_test_vectors=100000,
            extra_cflags="", output_signal_map=None, verilator_bin="verilator",
-           yosys_bin=None, artifact_dir=None, parallel_jobs=1):
+           yosys_bin=None, artifact_dir=None, parallel_jobs=1, yosys_timeout_s=600):
     """
     Verify verilog against cpp reference via verilator simulation.
     Returns (passed: bool, message: str).
@@ -73,6 +73,7 @@ def verify(cpp_path, verilog_code, module_name, pi_width, po_width,
             yosys_bin=yosys_bin,
             artifact_dir=artifact_dir,
             parallel_jobs=parallel_jobs,
+            yosys_timeout_s=yosys_timeout_s,
         )
         return _run_verification(paths)
 
@@ -91,11 +92,13 @@ def verify(cpp_path, verilog_code, module_name, pi_width, po_width,
             yosys_bin=yosys_bin,
             artifact_dir=tmpdir,
             parallel_jobs=parallel_jobs,
+            yosys_timeout_s=yosys_timeout_s,
         )
         return _run_verification(paths)
 
 
-def compile_only(verilog_code, module_name, verilator_bin="verilator", yosys_bin=None, artifact_dir=None):
+def compile_only(verilog_code, module_name, verilator_bin="verilator", yosys_bin=None, artifact_dir=None,
+                 yosys_timeout_s=600):
     """Run yosys + Verilator compile/lint checks on Verilog only."""
     # compile_only 给 snippet full-shell gate 使用：
     # 只回答“是否能编译”，不回答“功能是否等价”。
@@ -107,6 +110,7 @@ def compile_only(verilog_code, module_name, verilator_bin="verilator", yosys_bin
                 verilator_bin=verilator_bin,
                 yosys_bin=yosys_bin,
                 artifact_dir=artifact_dir,
+                yosys_timeout_s=yosys_timeout_s,
             )
         )
 
@@ -118,13 +122,14 @@ def compile_only(verilog_code, module_name, verilator_bin="verilator", yosys_bin
                 verilator_bin=verilator_bin,
                 yosys_bin=yosys_bin,
                 artifact_dir=tmpdir,
+                yosys_timeout_s=yosys_timeout_s,
             )
         )
 
 
 def _materialize_verification_artifacts(*, cpp_path, verilog_code, module_name, pi_width, po_width,
                                         num_tests, exhaustive, extra_cflags, output_signal_map,
-                                        verilator_bin, yosys_bin, artifact_dir, parallel_jobs):
+                                        verilator_bin, yosys_bin, artifact_dir, parallel_jobs, yosys_timeout_s):
     # 把一次 verify 所需的全部产物显式落盘，便于：
     # - 失败后离线复盘
     # - 用户手工进入 build 目录继续调试
@@ -161,6 +166,7 @@ def _materialize_verification_artifacts(*, cpp_path, verilog_code, module_name, 
         "output_signal_map": output_signal_map or [],
         "verilator_bin": verilator_bin,
         "yosys_bin": yosys_bin,
+        "yosys_timeout_s": max(1, int(yosys_timeout_s or 600)),
         "parallel_jobs": max(1, int(parallel_jobs or 1)),
     }
     with open(os.path.join(artifact_dir, "verify_meta.json"), "w") as f:
@@ -184,11 +190,13 @@ def _materialize_verification_artifacts(*, cpp_path, verilog_code, module_name, 
         "num_tests": num_tests,
         "exhaustive": exhaustive,
         "yosys_bin": yosys_bin,
+        "yosys_timeout_s": max(1, int(yosys_timeout_s or 600)),
         "parallel_jobs": max(1, int(parallel_jobs or 1)),
     }
 
 
-def _materialize_compile_only_artifacts(*, verilog_code, module_name, verilator_bin, yosys_bin, artifact_dir):
+def _materialize_compile_only_artifacts(*, verilog_code, module_name, verilator_bin, yosys_bin, artifact_dir,
+                                        yosys_timeout_s):
     os.makedirs(artifact_dir, exist_ok=True)
     is_sv = "typedef struct" in verilog_code or "always_comb" in verilog_code
     ext = ".sv" if is_sv else ".v"
@@ -201,6 +209,7 @@ def _materialize_compile_only_artifacts(*, verilog_code, module_name, verilator_
         "rtl_path": rtl_path,
         "verilator_bin": _normalize_tool_path(verilator_bin),
         "yosys_bin": _normalize_tool_path(yosys_bin),
+        "yosys_timeout_s": max(1, int(yosys_timeout_s or 600)),
     }
 
 
@@ -217,7 +226,25 @@ def _run_yosys_syntax_check(paths):
         f'hierarchy -check -top {paths["module_name"]}'
     )
     cmd = [yosys_bin, "-q", "-p", script]
-    ret = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    yosys_timeout = max(1, int(paths.get("yosys_timeout_s", 600) or 600))
+    try:
+        ret = subprocess.run(cmd, capture_output=True, text=True, timeout=yosys_timeout)
+    except subprocess.TimeoutExpired as exc:
+        stdout = _clip_text((exc.stdout or "").strip(), COMPILE_MSG_MAX_CHARS)
+        stderr = _clip_text((exc.stderr or "").strip(), COMPILE_MSG_MAX_CHARS)
+        _write_text(os.path.join(paths["artifact_dir"], "yosys_stdout.txt"), exc.stdout or "")
+        _write_text(os.path.join(paths["artifact_dir"], "yosys_stderr.txt"), exc.stderr or "")
+        msg = [
+            "YOSYS_TIMEOUT:",
+            f"Yosys exceeded timeout after {yosys_timeout}s.",
+            "---- Command ----",
+            " ".join(cmd),
+            "---- Yosys stdout ----",
+            stdout if stdout else "<empty>",
+            "---- Yosys stderr ----",
+            stderr if stderr else "<empty>",
+        ]
+        return False, "\n".join(msg)
     _write_text(os.path.join(paths["artifact_dir"], "yosys_stdout.txt"), ret.stdout or "")
     _write_text(os.path.join(paths["artifact_dir"], "yosys_stderr.txt"), ret.stderr or "")
     if ret.returncode == 0:
@@ -626,6 +653,7 @@ def main():
     parser.add_argument("--extra-cflags", default="")
     parser.add_argument("--verilator-bin", default="verilator")
     parser.add_argument("--yosys-bin", default=None)
+    parser.add_argument("--yosys-timeout-s", type=int, default=600)
     args = parser.parse_args()
 
     with open(args.rtl_path) as f:
@@ -650,6 +678,7 @@ def main():
         yosys_bin=args.yosys_bin,
         artifact_dir=args.out_dir,
         parallel_jobs=args.parallel_jobs,
+        yosys_timeout_s=args.yosys_timeout_s,
     )
     print(message)
     raise SystemExit(0 if passed else 1)

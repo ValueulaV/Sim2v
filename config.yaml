@@ -31,6 +31,7 @@ verify:
   max_test_vectors: 10000000
   exhaustive_threshold: 20
   parallel_jobs: 32
+  yosys_timeout_s: 3600
 
 snippet:
   enabled: true

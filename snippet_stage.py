@@ -294,6 +294,7 @@ def _run_one_method(*, cfg, logger, provider, client, task_dir, module_info,
                     verilator_bin=cfg["verilator"],
                     yosys_bin=cfg.get("yosys"),
                     parallel_jobs=granted_parallel_jobs,
+                    yosys_timeout_s=cfg.get("verify", {}).get("yosys_timeout_s", 600),
                 )
                 verify_elapsed = time.perf_counter() - verify_start
             finally:
@@ -441,6 +442,7 @@ def _run_full_shell_compile_gate(*, cfg, task_dir, module_info, combine_info, me
             verilator_bin=cfg["verilator"],
             yosys_bin=cfg.get("yosys"),
             artifact_dir=os.path.join(task_dir, f"{bf['module_name']}_fullshell_compile"),
+            yosys_timeout_s=cfg.get("verify", {}).get("yosys_timeout_s", 600),
         )
         if not ok:
             failures.append(f"[{bf['module_name']}]\n{msg}")

@@ -92,7 +92,14 @@ TRANSLATION_RULES = """\
     - Read: `tmp = arr[idx]; x = tmp.field;`
     - Write: `tmp = arr[idx]; tmp.field = ...; arr[idx] = tmp;`
     - Or use constant-bound loops / case statements that select whole elements, then access fields on the selected temporary.
-6d1. Yosys requires procedural `for` loops to have compile-time-constant init/condition/step expressions.
+6d1. For multi-dimensional aggregate arrays, never write forms like `arr[i][j].field` directly.
+     Use a typed temporary for the selected element first, e.g.:
+     - `req_tmp = in_dis2iss.req[i][j]; if (req_tmp.valid) ...`
+     - Never use `in_dis2iss.req[i][j].valid` directly.
+6d2. Never duplicate the container name after `in_*/out_*` mapping.
+     Example: C++ `out.iss2dis->ready_num[i]` must become `out_iss2dis.ready_num[i]`,
+     not `out_iss2dis.iss2dis.ready_num[i]`.
+6d3. Yosys requires procedural `for` loops to have compile-time-constant init/condition/step expressions.
      If the original C++ loop starts or ends from a runtime signal, rewrite it as a constant-bound loop
      over the full legal range and guard the body with `if (...)`.
 6e. Do not create extra named blocks such as `begin : helper_locals`.
@@ -113,6 +120,7 @@ Output rules (STRICT):
 3. You MAY declare local variables if needed, but:
    - do not redeclare/shadow framework-declared signals/fields
    - declare locals at the top of the method body before executable statements
+   - do not declare array-typed locals (packed or unpacked) inside the method body
    - do not declare unpacked-array locals inside procedural code
    - unconditionally initialize locals before any branching; assign defaults on all paths to avoid latches
    - if a C++ local would otherwise be conditionally assigned before later use, give it an explicit safe default
@@ -616,14 +624,11 @@ def build_prompts(input_dirs, output_path, base_dir=".", struct_expand_depth=2,
                     continue
                 method_helpers = extract_method_helpers(method["body"], helpers_db)
                 logic_text = method["body"] + "\n" + "\n".join(method_helpers.values())
-                method_expand_depth = struct_expand_depth
-                if module_info["module_type"] == "Isu":
-                    method_expand_depth = max(method_expand_depth, 3)
                 ordered = get_struct_order_for_method(
                     module_info["structs"],
                     module_info["module_type"],
                     method_body=logic_text,
-                    expand_depth=method_expand_depth,
+                    expand_depth=struct_expand_depth,
                 )
                 sv_typedefs = generate_sv_typedefs(
                     module_info["structs"], module_info["type_widths"],
