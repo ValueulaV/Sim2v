@@ -32,12 +32,12 @@ def get_client(model_name):
         return "anthropic", Anthropic(
             api_key=os.environ.get("AWS_API_KEY"),
             base_url="https://ace2.ezclaude.com",
-            timeout=3600,
+            timeout=900,
         )
     return "openai", OpenAI(
         api_key=os.environ["ARK_API_KEY"],
         base_url="https://ark.cn-beijing.volces.com/api/v3",
-        timeout=3600,
+        timeout=900,
     )
 
 
