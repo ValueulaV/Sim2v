@@ -14,6 +14,8 @@ COMPILE_MSG_MAX_CHARS = 10000
 
 
 def _clip_text(text, limit):
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
     text = text or ""
     if len(text) <= limit:
         return text
@@ -28,7 +30,8 @@ def _normalize_tool_path(path):
 def verify(cpp_path, verilog_code, module_name, pi_width, po_width,
            exhaustive_threshold=20, max_test_vectors=100000,
            extra_cflags="", output_signal_map=None, verilator_bin="verilator",
-           yosys_bin=None, artifact_dir=None, parallel_jobs=1, yosys_timeout_s=600):
+           yosys_bin=None, artifact_dir=None, parallel_jobs=1, yosys_timeout_s=600,
+           verilator_timeout_s=3600):
     """
     Verify verilog against cpp reference via verilator simulation.
     Returns (passed: bool, message: str).
@@ -74,6 +77,7 @@ def verify(cpp_path, verilog_code, module_name, pi_width, po_width,
             artifact_dir=artifact_dir,
             parallel_jobs=parallel_jobs,
             yosys_timeout_s=yosys_timeout_s,
+            verilator_timeout_s=verilator_timeout_s,
         )
         return _run_verification(paths)
 
@@ -93,12 +97,13 @@ def verify(cpp_path, verilog_code, module_name, pi_width, po_width,
             artifact_dir=tmpdir,
             parallel_jobs=parallel_jobs,
             yosys_timeout_s=yosys_timeout_s,
+            verilator_timeout_s=verilator_timeout_s,
         )
         return _run_verification(paths)
 
 
 def compile_only(verilog_code, module_name, verilator_bin="verilator", yosys_bin=None, artifact_dir=None,
-                 yosys_timeout_s=600):
+                 yosys_timeout_s=600, verilator_timeout_s=3600):
     """Run yosys + Verilator compile/lint checks on Verilog only."""
     # compile_only 给 snippet full-shell gate 使用：
     # 只回答“是否能编译”，不回答“功能是否等价”。
@@ -111,6 +116,7 @@ def compile_only(verilog_code, module_name, verilator_bin="verilator", yosys_bin
                 yosys_bin=yosys_bin,
                 artifact_dir=artifact_dir,
                 yosys_timeout_s=yosys_timeout_s,
+                verilator_timeout_s=verilator_timeout_s,
             )
         )
 
@@ -123,13 +129,15 @@ def compile_only(verilog_code, module_name, verilator_bin="verilator", yosys_bin
                 yosys_bin=yosys_bin,
                 artifact_dir=tmpdir,
                 yosys_timeout_s=yosys_timeout_s,
+                verilator_timeout_s=verilator_timeout_s,
             )
         )
 
 
 def _materialize_verification_artifacts(*, cpp_path, verilog_code, module_name, pi_width, po_width,
                                         num_tests, exhaustive, extra_cflags, output_signal_map,
-                                        verilator_bin, yosys_bin, artifact_dir, parallel_jobs, yosys_timeout_s):
+                                        verilator_bin, yosys_bin, artifact_dir, parallel_jobs, yosys_timeout_s,
+                                        verilator_timeout_s):
     # 把一次 verify 所需的全部产物显式落盘，便于：
     # - 失败后离线复盘
     # - 用户手工进入 build 目录继续调试
@@ -167,6 +175,7 @@ def _materialize_verification_artifacts(*, cpp_path, verilog_code, module_name, 
         "verilator_bin": verilator_bin,
         "yosys_bin": yosys_bin,
         "yosys_timeout_s": max(1, int(yosys_timeout_s or 600)),
+        "verilator_timeout_s": max(1, int(verilator_timeout_s or 3600)),
         "parallel_jobs": max(1, int(parallel_jobs or 1)),
     }
     with open(os.path.join(artifact_dir, "verify_meta.json"), "w") as f:
@@ -191,12 +200,13 @@ def _materialize_verification_artifacts(*, cpp_path, verilog_code, module_name, 
         "exhaustive": exhaustive,
         "yosys_bin": yosys_bin,
         "yosys_timeout_s": max(1, int(yosys_timeout_s or 600)),
+        "verilator_timeout_s": max(1, int(verilator_timeout_s or 3600)),
         "parallel_jobs": max(1, int(parallel_jobs or 1)),
     }
 
 
 def _materialize_compile_only_artifacts(*, verilog_code, module_name, verilator_bin, yosys_bin, artifact_dir,
-                                        yosys_timeout_s):
+                                        yosys_timeout_s, verilator_timeout_s):
     os.makedirs(artifact_dir, exist_ok=True)
     is_sv = "typedef struct" in verilog_code or "always_comb" in verilog_code
     ext = ".sv" if is_sv else ".v"
@@ -210,6 +220,7 @@ def _materialize_compile_only_artifacts(*, verilog_code, module_name, verilator_
         "verilator_bin": _normalize_tool_path(verilator_bin),
         "yosys_bin": _normalize_tool_path(yosys_bin),
         "yosys_timeout_s": max(1, int(yosys_timeout_s or 600)),
+        "verilator_timeout_s": max(1, int(verilator_timeout_s or 3600)),
     }
 
 
@@ -273,7 +284,31 @@ def _run_verification(paths):
     if not yosys_ok:
         return False, yosys_msg
 
-    ret = subprocess.run(paths["cmd"], shell=True, capture_output=True, text=True, timeout=1200)
+    verilator_timeout = max(1, int(paths.get("verilator_timeout_s", 3600) or 3600))
+    try:
+        ret = subprocess.run(
+            paths["cmd"],
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=verilator_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        _write_text(os.path.join(paths["artifact_dir"], "compile_stdout.txt"), exc.stdout or "")
+        _write_text(os.path.join(paths["artifact_dir"], "compile_stderr.txt"), exc.stderr or "")
+        stdout = _clip_text((exc.stdout or "").strip(), COMPILE_MSG_MAX_CHARS)
+        stderr = _clip_text((exc.stderr or "").strip(), COMPILE_MSG_MAX_CHARS)
+        msg = [
+            "COMPILE_TIMEOUT:",
+            f"Verilator compile exceeded timeout after {verilator_timeout}s.",
+            "---- Command ----",
+            paths["cmd"],
+            "---- Verilator stderr ----",
+            stderr if stderr else "<empty>",
+            "---- Verilator stdout ----",
+            stdout if stdout else "<empty>",
+        ]
+        return False, "\n".join(msg)
     _write_text(os.path.join(paths["artifact_dir"], "compile_stdout.txt"), ret.stdout or "")
     _write_text(os.path.join(paths["artifact_dir"], "compile_stderr.txt"), ret.stderr or "")
     if ret.returncode != 0:
@@ -296,7 +331,16 @@ def _run_verification(paths):
         jobs = 1
 
     if jobs == 1:
-        ret = subprocess.run(exe, capture_output=True, text=True, timeout=1200)
+        try:
+            ret = subprocess.run(exe, capture_output=True, text=True, timeout=verilator_timeout)
+        except subprocess.TimeoutExpired as exc:
+            _write_text(os.path.join(paths["artifact_dir"], "run_stdout.txt"), exc.stdout or "")
+            _write_text(os.path.join(paths["artifact_dir"], "run_stderr.txt"), exc.stderr or "")
+            msg = (
+                "SIMULATION_TIMEOUT:\n"
+                f"Simulation exceeded timeout after {verilator_timeout}s."
+            )
+            return False, msg
         _write_text(os.path.join(paths["artifact_dir"], "run_stdout.txt"), ret.stdout or "")
         _write_text(os.path.join(paths["artifact_dir"], "run_stderr.txt"), ret.stderr or "")
         if ret.returncode == 0 and "PASS" in ret.stdout:
@@ -314,7 +358,17 @@ def _run_verification(paths):
         for shard_id, count in enumerate(shard_counts):
             if count <= 0:
                 continue
-            futures.append(pool.submit(_run_one_shard, exe, shard_dir, shard_id, count, 42 + shard_id))
+            futures.append(
+                pool.submit(
+                    _run_one_shard,
+                    exe,
+                    shard_dir,
+                    shard_id,
+                    count,
+                    42 + shard_id,
+                    verilator_timeout,
+                )
+            )
         for fut in as_completed(futures):
             results.append(fut.result())
 
@@ -351,7 +405,8 @@ def _run_compile_only(paths):
         "--top-module", paths["module_name"],
         paths["rtl_path"],
     ]
-    ret = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+    verilator_timeout = max(1, int(paths.get("verilator_timeout_s", 3600) or 3600))
+    ret = subprocess.run(cmd, capture_output=True, text=True, timeout=verilator_timeout)
     _write_text(os.path.join(paths["artifact_dir"], "compile_stdout.txt"), ret.stdout or "")
     _write_text(os.path.join(paths["artifact_dir"], "compile_stderr.txt"), ret.stderr or "")
     if ret.returncode == 0:
@@ -377,9 +432,9 @@ def _split_counts(total, jobs):
     return [base + (1 if i < rem else 0) for i in range(jobs)]
 
 
-def _run_one_shard(exe, shard_dir, shard_id, count, seed):
+def _run_one_shard(exe, shard_dir, shard_id, count, seed, timeout_s):
     cmd = [exe, "--count", str(count), "--seed", str(seed)]
-    ret = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+    ret = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     _write_text(os.path.join(shard_dir, f"shard_{shard_id:02d}_stdout.txt"), ret.stdout or "")
     _write_text(os.path.join(shard_dir, f"shard_{shard_id:02d}_stderr.txt"), ret.stderr or "")
     return {
@@ -634,6 +689,8 @@ def _signal_summary_code(output_signal_map):
 
 
 def _write_text(path, text):
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
     with open(path, "w") as f:
         f.write(text)
 
@@ -654,6 +711,7 @@ def main():
     parser.add_argument("--verilator-bin", default="verilator")
     parser.add_argument("--yosys-bin", default=None)
     parser.add_argument("--yosys-timeout-s", type=int, default=600)
+    parser.add_argument("--verilator-timeout-s", type=int, default=3600)
     args = parser.parse_args()
 
     with open(args.rtl_path) as f:
@@ -679,6 +737,7 @@ def main():
         artifact_dir=args.out_dir,
         parallel_jobs=args.parallel_jobs,
         yosys_timeout_s=args.yosys_timeout_s,
+        verilator_timeout_s=args.verilator_timeout_s,
     )
     print(message)
     raise SystemExit(0 if passed else 1)

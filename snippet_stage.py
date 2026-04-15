@@ -162,6 +162,22 @@ def run(cfg, logger, run_dir, target=None):
             if not compare_plan["leaves"]:
                 logger.warning(f"Skip {task_name}: compare plan resolved to empty leaves")
                 continue
+            # 避免把 compare 目标回灌成 snippet 自由输入。
+            # 这会诱导模型“读当前 out 再写 out”，并显著放大 input harness 规模。
+            # 对 init 这类“大量输出需要在方法内构造”的初始化方法，保留输出回灌输入，
+            # 否则会把关键配置常量全部移掉，难以复现 C++ 初始化语义。
+            compare_labels = [leaf.get("label") for leaf in compare_plan["leaves"] if leaf.get("label")]
+            if method["name"] != "init":
+                input_plan = harness.drop_leaves_from_plan(input_plan, compare_labels)
+            if method["name"] == "init" and input_targets:
+                input_targets = []
+                input_plan = harness.build_signal_plan(
+                    module_info,
+                    input_targets,
+                    instance_name,
+                    loop_domains=loop_domains,
+                    respect_dependencies=True,
+                )
 
             task_dir = os.path.join(out_dir, task_name)
             os.makedirs(task_dir, exist_ok=True)
@@ -295,6 +311,7 @@ def _run_one_method(*, cfg, logger, provider, client, task_dir, module_info,
                     yosys_bin=cfg.get("yosys"),
                     parallel_jobs=granted_parallel_jobs,
                     yosys_timeout_s=cfg.get("verify", {}).get("yosys_timeout_s", 600),
+                    verilator_timeout_s=cfg.get("verify", {}).get("verilator_timeout_s", 3600),
                 )
                 verify_elapsed = time.perf_counter() - verify_start
             finally:
@@ -443,6 +460,7 @@ def _run_full_shell_compile_gate(*, cfg, task_dir, module_info, combine_info, me
             yosys_bin=cfg.get("yosys"),
             artifact_dir=os.path.join(task_dir, f"{bf['module_name']}_fullshell_compile"),
             yosys_timeout_s=cfg.get("verify", {}).get("yosys_timeout_s", 600),
+            verilator_timeout_s=cfg.get("verify", {}).get("verilator_timeout_s", 3600),
         )
         if not ok:
             failures.append(f"[{bf['module_name']}]\n{msg}")

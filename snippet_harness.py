@@ -52,6 +52,9 @@ Hard rules:
 - If the C++ does not assign a signal on some path, do not invent a replacement value from another signal
   with a similar name. Leave unrelated signals untouched unless the C++ explicitly writes them.
 - Preserve the C++ behavior exactly.
+- Avoid container/method-call artifacts from C++ STL-style APIs in translated SV.
+  `clear/push_back/reserve/resize/schedule/commit_issue/wakeup/tick` are not SV fields.
+  Implement their semantic effects on real signals/state instead of emitting pseudo member calls.
 - Keep the fix within a yosys-friendly synthesizable SystemVerilog subset. Avoid simulator-only or highly dynamic constructs.
 - Do not use `automatic` locals.
 - Do not use `break`, `continue`, or `disable` to exit loops. Rewrite with done-flags or gated execution.
@@ -171,10 +174,14 @@ def build_method_io_targets(module_info, method_name, max_targets):
     exact_paths = _extract_precise_signal_paths(method_body + "\n" + "\n".join(helpers.values()))
     reads = _refine_targets_with_exact_paths(reads, exact_paths)
     writes = _refine_targets_with_exact_paths(writes, exact_paths)
+    reads = _drop_non_signal_targets(reads)
+    writes = _drop_non_signal_targets(writes)
+    reads = _drop_unhelpful_root_reads(module_info, method_name, reads)
+    reads = _drop_self_feedback_reads(module_info, method_name, reads, writes)
     reads = _supplement_scalar_root_reads(module_info, method_body + "\n" + "\n".join(helpers.values()), reads)
     output_targets = _filter_targets(module_info, writes, max_targets=max_targets, allow_inputs=False)
     input_targets = _filter_targets(module_info, reads, max_targets=max_targets * 4, allow_inputs=True)
-    return _merge_targets(input_targets, output_targets), output_targets
+    return input_targets, output_targets
 
 
 def build_signal_plan(module_info, targets, instance_name, loop_domains=None, respect_dependencies=False):
@@ -211,6 +218,34 @@ def build_signal_plan(module_info, targets, instance_name, loop_domains=None, re
         "signal_map": signal_map,
         "pi_width": width,
         "po_width": width,
+    }
+
+
+def drop_leaves_from_plan(plan, blocked_labels):
+    # 从输入计划中移除和 compare 目标重叠的叶子，避免输出自反馈。
+    if not blocked_labels:
+        return plan
+    blocked = set(blocked_labels)
+    kept = []
+    for leaf in plan.get("leaves", []):
+        if leaf.get("label") in blocked:
+            continue
+        kept.append(dict(leaf))
+
+    signal_map = []
+    offset = 0
+    for leaf in kept:
+        width = int(leaf["width"])
+        leaf["offset"] = offset
+        signal_map.append({"path": leaf["label"], "width": width, "offset": offset})
+        offset += width
+
+    return {
+        "targets": list(plan.get("targets", [])),
+        "leaves": kept,
+        "signal_map": signal_map,
+        "pi_width": max(1, offset),
+        "po_width": max(1, offset),
     }
 
 
@@ -508,6 +543,79 @@ def _supplement_scalar_root_reads(module_info, text, reads):
             merged.append(name)
             existing.add(name)
     return merged
+
+
+_NON_SIGNAL_METHOD_NAMES = {
+    "clear",
+    "push_back",
+    "pop_back",
+    "reserve",
+    "resize",
+    "emplace_back",
+    "erase",
+    "insert",
+    "append",
+    "begin",
+    "end",
+    "tick",
+    "schedule",
+    "commit_issue",
+    "enqueue",
+    "wakeup",
+    "flush_all",
+    "flush_br",
+    "clear_br",
+}
+
+
+def _drop_non_signal_targets(paths):
+    # 文本 fallback 会把一部分容器/方法调用当成“路径”，例如
+    # `committed_indices_buf[i].clear` / `iqs[i].schedule`。
+    # 这些并非可打包的硬件信号，放进 input/compare target 会让 harness 无意义膨胀。
+    kept = []
+    for path in paths:
+        if not path:
+            continue
+        parts = _split_path_tokens(path)
+        if not parts:
+            continue
+        leaf_name, leaf_indices = _split_indexed_token(parts[-1])
+        if leaf_name in _NON_SIGNAL_METHOD_NAMES and not leaf_indices:
+            continue
+        kept.append(path)
+    return sorted(set(kept))
+
+
+def _drop_unhelpful_root_reads(module_info, method_name, reads):
+    # read-set 中有些“整块容器根路径”会被展开成大量无意义输入位，
+    # 既拖慢 snippet 编译，也会放大 LLM 生成空间。
+    # 目前先对 Isu::comb_issue 做精确裁剪，避免把 committed_indices_buf 整块喂给 harness。
+    if module_info.get("module_type") != "Isu" or method_name != "comb_issue":
+        return reads
+    filtered = []
+    for path in reads:
+        if path == "committed_indices_buf[i]":
+            continue
+        filtered.append(path)
+    return sorted(set(filtered))
+
+
+def _drop_self_feedback_reads(module_info, method_name, reads, writes):
+    # read-set 与 write-set 同时包含同一 out.* 路径时，
+    # snippet 会把“本应由方法计算的输出”回灌成自由输入，容易诱导出锁存/抄输入实现。
+    # 在当前 Isu 组合方法里，这类路径通常不是方法输入，而是方法内部写目标。
+    if module_info.get("module_type") != "Isu":
+        return reads
+    if method_name not in {"comb_issue", "comb_ready", "comb_awake", "comb_calc_latency_next", "init"}:
+        return reads
+    write_set = set(writes)
+    filtered = []
+    for path in reads:
+        canon = _canonical_target_path(path)
+        if canon.startswith("out.") and canon in write_set:
+            continue
+        filtered.append(path)
+    return sorted(set(filtered))
 
 
 def _fallback_write_targets(module_info, method_name, method_body=None):
@@ -853,46 +961,10 @@ def _sv_leaf_expr(module_info, label):
 
 
 def _sv_leaf_lhs_expr(module_info, label):
-    # 输入解包落到 packed struct/packed array 子字段时，
-    # Yosys 对 `arr[idx].field = ...` 这类左值支持并不稳定。
-    # 这里保守地把 LHS 降成位切片，避免前端语法问题。
-    roots = _build_roots(module_info, instance_name="")
-    parts = _split_path_tokens(label)
-    if not parts:
-        return label
-
-    if parts[0] in ("in", "out") and len(parts) >= 2:
-        root_name, root_indices = _split_indexed_token(parts[1])
-        root_key = f"{parts[0]}.{root_name}"
-        remain = parts[2:]
-    else:
-        root_name, root_indices = _split_indexed_token(parts[0])
-        root_key = root_name
-        remain = parts[1:]
-
-    root = roots.get(root_key)
-    if not root:
-        return _sv_path_expr(label)
-
-    base_expr = root["sv_expr"]
-    root_dims = list(root.get("array_dims") or [])
-    for expr, dim in zip(root_indices, root_dims):
-        base_expr += f"[{_sv_array_index_expr(expr, width=_index_bit_width(dim))}]"
-
-    if not remain:
-        return base_expr
-
-    lsb_expr, leaf_width = _packed_subpath_offset(
-        module_info,
-        root.get("type"),
-        root.get("width"),
-        remain,
-    )
-    if lsb_expr is None or leaf_width is None:
-        return _sv_path_expr(label)
-    if int(leaf_width) == 1:
-        return f"{base_expr}[{lsb_expr}]"
-    return f"{base_expr}[{lsb_expr} +: {int(leaf_width)}]"
+    # 原先这里把 LHS 强制降成 packed 位切片（例如 `iqs[0][20544 +: 32]`），
+    # 会触发大量隐式 wire / 越界副作用，导致 snippet 输入注入不稳定。
+    # 统一回到结构化路径写法，和 compare/调试视图保持一致。
+    return _sv_path_expr(label)
 
 
 def _packed_subpath_offset(module_info, type_name, width, tokens):

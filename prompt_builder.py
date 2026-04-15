@@ -104,6 +104,9 @@ TRANSLATION_RULES = """\
      over the full legal range and guard the body with `if (...)`.
 6e. Do not create extra named blocks such as `begin : helper_locals`.
 6f. Do not invent new typedef names. Use only typedef names that already appear in the provided type context.
+6g. Do not emit C++ container/member-method calls in SystemVerilog snippets.
+    Names like `clear`, `push_back`, `reserve`, `resize`, `schedule`, `commit_issue`, `wakeup`, `tick`
+    are C++ APIs, not synthesizable SV fields/methods in this framework.
 7. Preserve update semantics exactly:
    - `x++`, `++x`, `x += y`, `x--`, `--x`, `x -= y` update `x` itself.
    - If the C++ writes `x_1++`, translate that as an update to `x_1`, not `x`.
