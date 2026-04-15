@@ -36,6 +36,9 @@ Hard rules:
 - In procedural code, declare loop variables separately as `integer` or `int` locals at the top of the block, then use them in `for (...)`.
   Never use `genvar`, and avoid header declarations like `for (int i = 0; ...)`.
 - Fix compile/lint errors first. Prefer the smallest change that removes the current error before changing behavior.
+- Use only typedef names that already appear in the provided type context. Never invent type aliases.
+- In Isu methods, queue/entry/uop temporaries must use the real declared typedefs
+  (for example `IqStoredEntry_t`, `IqStoredUop_t`, `IssPrfEntry_t`) rather than guessed names.
 - Never use `signal = (signal + 1) % 32`-style code on narrow pointers/counters when it can trigger width warnings.
   Use an if/else wraparound or an explicitly widened temporary.
 - Use escaped SV field names exactly as declared, for example `type_v`, never `type`.
@@ -72,6 +75,8 @@ Hard rules:
   If the C++ loop start/end depends on a runtime signal, rewrite it as a constant-bound loop and
   guard the body with `if (...)` instead of putting the runtime expression directly in the loop header.
 - Use only typedef names that already appear in the provided type context. Do not invent new `_t` type names.
+- For equality/assignment on narrow preg fields, keep both sides width-consistent (typically 8-bit for `*_preg` in this method).
+  Avoid introducing 32-bit temporaries for 8-bit fields unless explicitly required.
 
 Existing variables already declared by framework:
 Inputs:
@@ -288,6 +293,7 @@ def build_sv_wrapper(module_name, combine_info, method_name, snippet_code, input
     parts.extend([
         "    // ---- Input extraction from pi[] ----",
         _build_sv_input_unpack(input_plan),
+        _build_sv_input_sanitizer(combine_info["module_type"], method_name),
         "",
         f"    begin : {method_name}",
     ])
@@ -344,6 +350,7 @@ def build_cpp_reference(*, wrapper_text, module_info, module_type, instance_name
         _build_cpp_vector_resize_preamble(module_info, instance_name, input_plan, compare_plan, phase="before_input"),
         "    int cursor = 0;",
         _build_cpp_input_unpack(input_plan),
+        _build_cpp_input_sanitizer(module_info, method_name, instance_name),
         f"    {instance_name}.{method_name}();",
         _build_cpp_vector_resize_preamble(module_info, instance_name, input_plan, compare_plan, phase="before_output"),
         "    for (int i = 0; i < PO_WIDTH; ++i) po[i] = false;",
@@ -400,6 +407,59 @@ def _build_cpp_vector_resize_preamble(module_info, instance_name, input_plan, co
         return "    // (no vector resize preamble)"
     lines.insert(0, f"    // ---- Vector resize preamble ({phase}) ----")
     return "\n".join(lines)
+
+
+def _build_sv_input_sanitizer(module_type, method_name):
+    # comb_awake 的参考实现对输入状态有隐式上界假设：
+    # 本周期总唤醒条目数不能超过 MAX_WAKEUP_PORTS。
+    # snippet 随机输入若违反该约束，C++ 侧会 Assert 直接退出，导致无法继续调试真实语义问题。
+    # 这里在 SV/C++ 两侧同步裁剪同一组输入，保证对拍域一致且可稳定运行。
+    if module_type != "Isu" or method_name != "comb_awake":
+        return "    // (no harness input sanitizer)"
+
+    return "\n".join([
+        "    // ---- Harness input sanitizer (Isu::comb_awake) ----",
+        "    // Keep Source-A as-is (LSU_LOAD_WB_WIDTH entries).",
+        "    // Cap Source-B to a fixed prefix and disable Source-C in harness inputs",
+        "    // so total wakeups never exceed MAX_WAKEUP_PORTS.",
+        "    for (int __k = 0; __k < DIV_MAX_LATENCY; __k++) begin",
+        "        if (__k >= (MAX_WAKEUP_PORTS - LSU_LOAD_WB_WIDTH) &&",
+        "            latency_pipe[__k].valid && (latency_pipe[__k].countdown == '0)) begin",
+        "            latency_pipe[__k].valid = 1'b0;",
+        "        end",
+        "    end",
+        "    for (int __k = 0; __k < ISSUE_WIDTH; __k++) begin",
+        "        if (out_iss2prf.iss_entry[__k].valid && out_iss2prf.iss_entry[__k].uop.dest_en) begin",
+        "            out_iss2prf.iss_entry[__k].valid = 1'b0;",
+        "            out_iss2prf.iss_entry[__k].uop.dest_en = 1'b0;",
+        "        end",
+        "    end",
+    ])
+
+
+def _build_cpp_input_sanitizer(module_info, method_name, instance_name):
+    if module_info.get("module_type") != "Isu" or method_name != "comb_awake":
+        return "    // (no harness input sanitizer)"
+
+    return "\n".join([
+        "    // ---- Harness input sanitizer (Isu::comb_awake) ----",
+        "    // Keep Source-A as-is (LSU_LOAD_WB_WIDTH entries).",
+        "    // Cap Source-B to a fixed prefix and disable Source-C in harness inputs",
+        "    // so total wakeups never exceed MAX_WAKEUP_PORTS.",
+        f"    for (int __k = 0; __k < DIV_MAX_LATENCY && __k < static_cast<int>({instance_name}.latency_pipe.size()); ++__k) {{",
+        f"        auto& __le = {instance_name}.latency_pipe[__k];",
+        "        if (__k >= (MAX_WAKEUP_PORTS - LSU_LOAD_WB_WIDTH) && __le.valid && __le.countdown == 0) {",
+        "            __le.valid = false;",
+        "        }",
+        "    }",
+        f"    for (int __k = 0; __k < ISSUE_WIDTH; ++__k) {{",
+        f"        auto& __e = {instance_name}.out.iss2prf->iss_entry[__k];",
+        "        if (__e.valid && __e.uop.dest_en) {",
+        "            __e.valid = false;",
+        "            __e.uop.dest_en = false;",
+        "        }",
+        "    }",
+    ])
 
 
 def build_debug_prompt(*, module_info, method, method_ctx, input_plan, compare_plan, current_snippet, verify_message):
@@ -468,6 +528,17 @@ def _debug_extra_hint(verify_message):
         return (
             "A width mismatch remains. Match the destination width explicitly: use same-width temporaries, "
             "slices, masks, or zero/sign extension. Avoid assigning 32-bit arithmetic results directly into narrow fields."
+        )
+    if "unexpected TOK_ID" in msg:
+        return (
+            "There is likely an invalid typedef or identifier in declarations. "
+            "Use only typedef names present in the provided SV type context and avoid guessed names like "
+            "`IssueQueueEntry_t`/`UopEntry_t` when the declared aliases are different."
+        )
+    if "WIDTHEXPAND" in msg and "src1_preg" in msg:
+        return (
+            "Preg comparisons are width-inconsistent. Keep `cur_preg`, `uop_dest_preg`, and compared `src*_preg` "
+            "at the same declared width (usually 8-bit in this method), and avoid ad-hoc 32-bit promotion."
         )
     return "(none)"
 

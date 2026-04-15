@@ -104,6 +104,9 @@ TRANSLATION_RULES = """\
      over the full legal range and guard the body with `if (...)`.
 6e. Do not create extra named blocks such as `begin : helper_locals`.
 6f. Do not invent new typedef names. Use only typedef names that already appear in the provided type context.
+6f1. Do not guess queue/entry/uop typedef aliases from C++ class names.
+     For Isu queue wakeup logic, use only declared aliases from the provided SV typedef section
+     (e.g. `IqStoredEntry_t`, `IqStoredUop_t`, `IssPrfEntry_t`).
 6g. Do not emit C++ container/member-method calls in SystemVerilog snippets.
     Names like `clear`, `push_back`, `reserve`, `resize`, `schedule`, `commit_issue`, `wakeup`, `tick`
     are C++ APIs, not synthesizable SV fields/methods in this framework.
@@ -139,7 +142,10 @@ Output rules (STRICT):
    When the C++ performs an in-place update on that signal, update that same signal directly.
    Example: C++ `count_1--;` means SystemVerilog `count_1 = count_1 - 1;`, not `count_1 = count - 1;`.
 5. Keep widths explicit: use casts/slices/masks to avoid WIDTHEXPAND/WIDTHTRUNC.
-   For power-of-two modulo on fixed-width vars, prefer `& mask` or slices."""
+   For power-of-two modulo on fixed-width vars, prefer `& mask` or slices.
+5a. Keep field comparisons width-consistent:
+    if a field is declared 8-bit (e.g. `*_preg`), compare/assign with 8-bit temporaries or slices.
+    Avoid widening one side to 32-bit unless the destination/operation truly requires 32-bit."""
 
 
 METHOD_PROMPT_TEMPLATE = """\

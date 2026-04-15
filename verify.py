@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 
@@ -19,8 +20,15 @@ def _clip_text(text, limit):
     text = text or ""
     if len(text) <= limit:
         return text
-    remain = len(text) - limit
-    return text[:limit] + f"\n... [truncated {remain} chars]"
+    # Keep both the head and tail so the final/root-cause error lines are visible.
+    head = int(limit * 0.6)
+    tail = max(0, limit - head)
+    remain = len(text) - head - tail
+    return (
+        text[:head]
+        + f"\n... [truncated {remain} chars] ...\n"
+        + text[-tail:]
+    )
 
 
 def _normalize_tool_path(path):
@@ -59,6 +67,10 @@ def verify(cpp_path, verilog_code, module_name, pi_width, po_width,
             extra_cflags = include_flag
         elif include_flag not in extra_cflags:
             extra_cflags = f"{extra_cflags} {include_flag}".strip()
+        # Simulator headers emit many host-compiler format warnings that are unrelated
+        # to snippet logic quality and drown useful diagnostics.
+        if "-Wno-format" not in extra_cflags:
+            extra_cflags = f"{extra_cflags} -Wno-format".strip()
 
     if artifact_dir:
         paths = _materialize_verification_artifacts(
@@ -170,19 +182,36 @@ def _materialize_verification_artifacts(*, cpp_path, verilog_code, module_name, 
 
     build_dir = os.path.join(artifact_dir, "build")
     cflags = f"-std=c++17 -O2 {extra_cflags}".strip()
-    cmd = (
-        f'{verilator_bin} -Wno-SYMRSVDWORD -Wno-WIDTHCONCAT --cc "{rtl_path}" --exe "{tb_path}" '
-        f"--build --top-module {module_name} "
-        f'--Mdir "{build_dir}" '
-        f'-CFLAGS "{cflags}"'
-    )
+    verilate_cmd = [
+        verilator_bin,
+        "-Wno-SYMRSVDWORD",
+        "-Wno-WIDTHCONCAT",
+        "--cc", rtl_path,
+        "--exe", tb_path,
+        "--top-module", module_name,
+        "--Mdir", build_dir,
+        "-CFLAGS", cflags,
+    ]
+    # Work around toolchain/config variants where Verilator's generated makefiles
+    # reference `__pch.h.fast` / `__pch.h.slow` as plain files instead of proper
+    # compiler include options. Overriding these vars keeps builds stable.
+    make_cmd = [
+        "make",
+        "-C", build_dir,
+        "-f", f"V{module_name}.mk",
+        f"V{module_name}",
+        "-j1",
+        "VK_PCH_I_FAST=",
+        "VK_PCH_I_SLOW=",
+    ]
     return {
         "artifact_dir": artifact_dir,
         "module_name": module_name,
         "rtl_path": rtl_path,
         "tb_path": tb_path,
         "build_dir": build_dir,
-        "cmd": cmd,
+        "verilate_cmd": verilate_cmd,
+        "make_cmd": make_cmd,
         "num_tests": num_tests,
         "exhaustive": exhaustive,
         "yosys_bin": yosys_bin,
@@ -248,16 +277,46 @@ def _run_verification(paths):
     if not yosys_ok:
         return False, yosys_msg
 
-    ret = subprocess.run(paths["cmd"], shell=True, capture_output=True, text=True, timeout=1200)
-    _write_text(os.path.join(paths["artifact_dir"], "compile_stdout.txt"), ret.stdout or "")
-    _write_text(os.path.join(paths["artifact_dir"], "compile_stderr.txt"), ret.stderr or "")
-    if ret.returncode != 0:
-        stderr = _clip_text(ret.stderr.strip(), COMPILE_MSG_MAX_CHARS)
-        stdout = _clip_text(ret.stdout.strip(), COMPILE_MSG_MAX_CHARS)
+    ret_gen = subprocess.run(paths["verilate_cmd"], capture_output=True, text=True, timeout=1200)
+    ret_build = None
+    if ret_gen.returncode == 0:
+        ret_build = subprocess.run(paths["make_cmd"], capture_output=True, text=True, timeout=1200)
+
+    compile_stdout_parts = []
+    compile_stderr_parts = []
+    if ret_gen.stdout:
+        compile_stdout_parts.append("---- Verilator generate stdout ----\n" + ret_gen.stdout.rstrip())
+    if ret_gen.stderr:
+        compile_stderr_parts.append("---- Verilator generate stderr ----\n" + ret_gen.stderr.rstrip())
+    if ret_build and ret_build.stdout:
+        compile_stdout_parts.append("---- Make build stdout ----\n" + ret_build.stdout.rstrip())
+    if ret_build and ret_build.stderr:
+        compile_stderr_parts.append("---- Make build stderr ----\n" + ret_build.stderr.rstrip())
+    _write_text(
+        os.path.join(paths["artifact_dir"], "compile_stdout.txt"),
+        ("\n\n".join(compile_stdout_parts) + "\n") if compile_stdout_parts else "",
+    )
+    _write_text(
+        os.path.join(paths["artifact_dir"], "compile_stderr.txt"),
+        ("\n\n".join(compile_stderr_parts) + "\n") if compile_stderr_parts else "",
+    )
+
+    compile_failed = (ret_gen.returncode != 0) or (ret_build is not None and ret_build.returncode != 0)
+    if compile_failed:
+        stderr = _clip_text(
+            ("\n\n".join(compile_stderr_parts)).strip(),
+            COMPILE_MSG_MAX_CHARS,
+        )
+        stdout = _clip_text(
+            ("\n\n".join(compile_stdout_parts)).strip(),
+            COMPILE_MSG_MAX_CHARS,
+        )
         msg = [
             "COMPILE_ERROR:",
-            "---- Command ----",
-            paths["cmd"],
+            "---- Verilator Generate Command ----",
+            shlex.join(paths["verilate_cmd"]),
+            "---- Make Build Command ----",
+            shlex.join(paths["make_cmd"]),
             "---- Verilator stderr ----",
             stderr if stderr else "<empty>",
             "---- Verilator stdout ----",
