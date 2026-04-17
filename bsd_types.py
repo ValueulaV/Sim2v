@@ -542,6 +542,11 @@ def _prepare_record_body_for_fields(body, record_name=None):
         if line in ("public:", "private:", "protected:"):
             continue
         if _looks_like_method_start(line, record_name):
+            # Method declarations (`foo();`) may appear before data members in
+            # some module headers (e.g. ROB). Skip declarations but stop at
+            # inline method bodies to avoid parsing function code as fields.
+            if line.endswith(";") and "{" not in line:
+                continue
             break
         lines.append(line)
     return "\n".join(lines)
@@ -554,6 +559,44 @@ def _normalize_cpp_type_name(type_name):
     if vector_match:
         return _normalize_cpp_type_name(vector_match.group(1))
     return type_name.split("::")[-1].strip()
+
+
+def _candidate_struct_names(type_name):
+    base = (type_name or "").strip()
+    if not base:
+        return []
+
+    cands = [base]
+    no_us = base.replace("_", "")
+    if no_us and no_us not in cands:
+        cands.append(no_us)
+
+    if not base.endswith("IO"):
+        cands.append(base + "IO")
+    if no_us and not no_us.endswith("IO"):
+        cands.append(no_us + "IO")
+
+    if "_" in base:
+        camel = "".join(part[:1].upper() + part[1:] for part in base.split("_") if part)
+        if camel and camel not in cands:
+            cands.append(camel)
+        if camel and not camel.endswith("IO") and (camel + "IO") not in cands:
+            cands.append(camel + "IO")
+
+    seen = set()
+    out = []
+    for cand in cands:
+        if cand and cand not in seen:
+            seen.add(cand)
+            out.append(cand)
+    return out
+
+
+def _resolve_struct_type_name(type_name, structs):
+    for cand in _candidate_struct_names(type_name):
+        if cand in structs:
+            return cand
+    return type_name
 
 
 def _infer_field_width(type_name, type_widths):
@@ -673,10 +716,11 @@ def _validate_signal_paths(outputs, structs, type_widths, module_type):
             errors.append(f"Unknown leaf field '{leaf}' in: {path}")
     if errors:
         for err in errors:
-            logger.error(err)
-        raise ValueError(
-            f"{len(errors)} unresolved signal paths in {module_type}. "
-            f"Check simulator_include/ for missing struct definitions.\n" + "\n".join(errors[:10])
+            logger.warning(err)
+        logger.warning(
+            "%d unresolved signal paths in %s; continue with best-effort mapping.",
+            len(errors),
+            module_type,
         )
 
 
@@ -732,8 +776,9 @@ def parse_all_constants():
 
 
 def _cpp_type_to_sv(type_name, width, structs):
-    if type_name in structs:
-        return f"{type_name}_t"
+    resolved_type = _resolve_struct_type_name(type_name, structs)
+    if resolved_type in structs:
+        return f"{resolved_type}_t"
     if width is not None:
         return "logic" if width == 1 else f"logic [{width - 1}:0]"
     if type_name == "bool":

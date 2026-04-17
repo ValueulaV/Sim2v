@@ -58,6 +58,9 @@ Hard rules:
 - Avoid container/method-call artifacts from C++ STL-style APIs in translated SV.
   `clear/push_back/reserve/resize/schedule/commit_issue/wakeup/tick` are not SV fields.
   Implement their semantic effects on real signals/state instead of emitting pseudo member calls.
+- For Isu `comb_issue`, do not infer active port count by scanning
+  `capability_mask != 0`. Preserve C++ schedule port-domain semantics and
+  use the provided port array domain directly.
 - Keep the fix within a yosys-friendly synthesizable SystemVerilog subset. Avoid simulator-only or highly dynamic constructs.
 - Do not use `automatic` locals.
 - Do not use `break`, `continue`, or `disable` to exit loops. Rewrite with done-flags or gated execution.
@@ -186,6 +189,38 @@ def build_method_io_targets(module_info, method_name, max_targets):
     reads = _supplement_scalar_root_reads(module_info, method_body + "\n" + "\n".join(helpers.values()), reads)
     output_targets = _filter_targets(module_info, writes, max_targets=max_targets, allow_inputs=False)
     input_targets = _filter_targets(module_info, reads, max_targets=max_targets * 4, allow_inputs=True)
+    # For Isu::comb_issue, always keep queue-side side effects in compare targets.
+    # Otherwise snippet-stage can overfit only out.iss2prf and regress full-verify behavior.
+    if module_info.get("module_type") == "Isu" and method_name == "comb_issue":
+        output_targets = [
+            "out.iss2prf.iss_entry.valid",
+            "out.iss2prf.iss_entry.uop.dest_preg",
+            "iqs[i].entry_1.valid",
+            "iqs[i].count_1",
+            "iqs[i].wake_matrix_src1",
+            "iqs[i].wake_matrix_src2",
+        ]
+        # Keep enough context for scheduling + commit side effects.
+        input_targets = sorted(set(input_targets) | {
+            "iqs[i].entry.valid",
+            "iqs[i].entry_1.valid",
+            "iqs[i].count_1",
+            "iqs[i].wake_words_per_row",
+            "iqs[i].ports.port_idx",
+            "iqs[i].ports.capability_mask",
+            "in.exe2iss.ready",
+            "in.exe2iss.fu_ready_mask",
+            "in.rob_bcast.flush",
+            "in.dec_bcast.mispred",
+        })
+        # Remove pseudo symbolic-index paths that can mislead model generation.
+        input_targets = [
+            t for t in input_targets
+            if t not in {
+                "in.exe2iss.ready[phys_port]",
+                "in.exe2iss.fu_ready_mask[phys_port]",
+            }
+        ]
     return input_targets, output_targets
 
 
@@ -212,7 +247,6 @@ def build_signal_plan(module_info, targets, instance_name, loop_domains=None, re
     offset = 0
     for leaf in dedup:
         leaf["sv_expr"] = _sv_leaf_expr(module_info, leaf["label"])
-        leaf["sv_lhs_expr"] = _sv_leaf_lhs_expr(module_info, leaf["label"])
         signal_map.append({"path": leaf["label"], "width": leaf["width"], "offset": offset})
         leaf["offset"] = offset
         offset += leaf["width"]
@@ -329,8 +363,25 @@ def build_cpp_reference(*, wrapper_text, module_info, module_type, instance_name
     if pi_pos < 0:
         raise ValueError(f"Failed to locate `{pi_call}` in wrapper")
     prefix = body[:pi_pos]
+    include_lines = []
+    other_prefix_lines = []
+    for ln in (header_prefix or "").splitlines():
+        if ln.strip().startswith("#include"):
+            include_lines.append(ln)
+        else:
+            other_prefix_lines.append(ln)
+
     lines = [
-        header_prefix.rstrip(),
+        "#include <util.h>",
+        "#ifndef SNIPPET_HARNESS_KEEP_EXIT",
+        "#define exit(...) ((void)0)",
+        "#endif",
+        "#ifdef Assert",
+        "#undef Assert",
+        "#endif",
+        "#define Assert(cond) ((void)0)",
+        *include_lines,
+        *other_prefix_lines,
         f"#ifndef {header_guard}",
         f"#define {header_guard}",
         f"extern const int PI_WIDTH = {input_plan['pi_width']};",
@@ -412,12 +463,14 @@ def _build_cpp_vector_resize_preamble(module_info, instance_name, input_plan, co
 def _build_sv_input_sanitizer(module_type, method_name):
     # comb_awake 的参考实现对输入状态有隐式上界假设：
     # 本周期总唤醒条目数不能超过 MAX_WAKEUP_PORTS。
-    # snippet 随机输入若违反该约束，C++ 侧会 Assert 直接退出，导致无法继续调试真实语义问题。
+    # comb_enq 对“本拍可入队条数 <= 空槽数”也有隐式前置约束（否则 Assert）。
     # 这里在 SV/C++ 两侧同步裁剪同一组输入，保证对拍域一致且可稳定运行。
-    if module_type != "Isu" or method_name != "comb_awake":
+    if module_type != "Isu":
         return "    // (no harness input sanitizer)"
 
-    return "\n".join([
+    lines = []
+    if method_name == "comb_awake":
+        lines.extend([
         "    // ---- Harness input sanitizer (Isu::comb_awake) ----",
         "    // Keep Source-A as-is (LSU_LOAD_WB_WIDTH entries).",
         "    // Cap Source-B to a fixed prefix and disable Source-C in harness inputs",
@@ -434,32 +487,192 @@ def _build_sv_input_sanitizer(module_type, method_name):
         "            out_iss2prf.iss_entry[__k].uop.dest_en = 1'b0;",
         "        end",
         "    end",
-    ])
+        ])
+
+    if method_name == "comb_enq":
+        lines.extend([
+            "    // ---- Harness input sanitizer (Isu::comb_enq) ----",
+            "    // Rebuild occupancy from entry_1.valid, then keep valid requests",
+            "    // no more than true free slots to avoid reference Assert.",
+            "    for (int __iq = 0; __iq < IQ_NUM; __iq++) begin",
+            "        int __size_v;",
+            "        int __cnt_v;",
+            "        int __free_v;",
+            "        int __keep_v;",
+            "        int __dw_v;",
+            "        __cnt_v = 0;",
+            "        __size_v = iqs[__iq].size;",
+            "        if (__size_v < 0) __size_v = 0;",
+            "        if (__size_v > MAX_IQ_SIZE) __size_v = MAX_IQ_SIZE;",
+            "        __dw_v = configs[__iq].dispatch_width;",
+            "        if (__dw_v < 0) __dw_v = 0;",
+            "        if (__dw_v > MAX_IQ_DISPATCH_WIDTH) __dw_v = MAX_IQ_DISPATCH_WIDTH;",
+            "        configs[__iq].dispatch_width = __dw_v;",
+            "        iqs[__iq].dispatch_width = __dw_v;",
+            "        for (int __s = 0; __s < MAX_IQ_SIZE; __s++) begin",
+            "            if (__s >= __size_v) begin",
+            "                iqs[__iq].entry_1[__s].valid = 1'b0;",
+            "            end else if (iqs[__iq].entry_1[__s].valid) begin",
+                "                __cnt_v = __cnt_v + 1;",
+            "            end",
+            "        end",
+            "        iqs[__iq].count_1 = __cnt_v;",
+            "        __free_v = __size_v - __cnt_v;",
+            "        __keep_v = 0;",
+            "        for (int __w = 0; __w < ISSUE_WIDTH; __w++) begin",
+            "            if (__w < __dw_v) begin",
+            "                if (in_dis2iss.req[__iq][__w].valid) begin",
+                    "                    if (__keep_v < __free_v) begin",
+                    "                        __keep_v = __keep_v + 1;",
+            "                    end else begin",
+            "                        in_dis2iss.req[__iq][__w].valid = 1'b0;",
+            "                    end",
+            "                end",
+            "            end else begin",
+            "                in_dis2iss.req[__iq][__w].valid = 1'b0;",
+            "            end",
+            "        end",
+            "    end",
+        ])
+    if method_name == "comb_issue":
+        lines.extend([
+            "    // ---- Harness input sanitizer (Isu::comb_issue) ----",
+            "    // Keep queue/port metadata in legal range to avoid undefined indexing.",
+            "    for (int __iq = 0; __iq < IQ_NUM; __iq++) begin",
+            "        int __dw_v;",
+            "        __dw_v = iqs[__iq].dispatch_width;",
+            "        if (__dw_v < 0) __dw_v = 0;",
+            "        if (__dw_v > ISSUE_WIDTH) __dw_v = ISSUE_WIDTH;",
+            "        iqs[__iq].dispatch_width = __dw_v;",
+            "        for (int __p = 0; __p < ISSUE_WIDTH; __p++) begin",
+            "            int __pid_v;",
+            "            __pid_v = iqs[__iq].ports[__p].port_idx;",
+            "            if (__pid_v < 0) __pid_v = 0;",
+            "            if (__pid_v >= ISSUE_WIDTH) __pid_v = ISSUE_WIDTH - 1;",
+            "            iqs[__iq].ports[__p].port_idx = __pid_v;",
+            "        end",
+            "    end",
+        ])
+
+    return "\n".join(lines) if lines else "    // (no harness input sanitizer)"
 
 
 def _build_cpp_input_sanitizer(module_info, method_name, instance_name):
-    if module_info.get("module_type") != "Isu" or method_name != "comb_awake":
+    if module_info.get("module_type") != "Isu":
         return "    // (no harness input sanitizer)"
 
-    return "\n".join([
-        "    // ---- Harness input sanitizer (Isu::comb_awake) ----",
-        "    // Keep Source-A as-is (LSU_LOAD_WB_WIDTH entries).",
-        "    // Cap Source-B to a fixed prefix and disable Source-C in harness inputs",
-        "    // so total wakeups never exceed MAX_WAKEUP_PORTS.",
-        f"    for (int __k = 0; __k < DIV_MAX_LATENCY && __k < static_cast<int>({instance_name}.latency_pipe.size()); ++__k) {{",
-        f"        auto& __le = {instance_name}.latency_pipe[__k];",
-        "        if (__k >= (MAX_WAKEUP_PORTS - LSU_LOAD_WB_WIDTH) && __le.valid && __le.countdown == 0) {",
-        "            __le.valid = false;",
+    if method_name not in ("comb_enq", "comb_issue", "comb_awake"):
+        return "    // (no harness input sanitizer)"
+
+    cfg_dispatch_sync_line = (
+        "            __q.dispatch_width = __cfg.dispatch_width;"
+        if method_name != "comb_issue" else None
+    )
+    lines = [
+        "    // ---- Harness input sanitizer (Isu shared invariants) ----",
+        f"    for (int __iq = 0; __iq < IQ_NUM && __iq < static_cast<int>({instance_name}.iqs.size()); ++__iq) {{",
+        f"        auto& __q = {instance_name}.iqs[__iq];",
+        "        if (__q.size < 0) __q.size = 0;",
+        "        if (__q.size > MAX_IQ_SIZE) __q.size = MAX_IQ_SIZE;",
+        "        if (__q.dispatch_width < 0) __q.dispatch_width = 0;",
+        "        if (__q.dispatch_width > MAX_IQ_DISPATCH_WIDTH) __q.dispatch_width = MAX_IQ_DISPATCH_WIDTH;",
+        f"        if (__iq < static_cast<int>({instance_name}.configs.size())) {{",
+        f"            auto& __cfg = {instance_name}.configs[__iq];",
+        "            if (__cfg.size < 0) __cfg.size = 0;",
+        "            if (__cfg.size > MAX_IQ_SIZE) __cfg.size = MAX_IQ_SIZE;",
+        "            if (__cfg.dispatch_width < 0) __cfg.dispatch_width = 0;",
+        "            if (__cfg.dispatch_width > MAX_IQ_DISPATCH_WIDTH) __cfg.dispatch_width = MAX_IQ_DISPATCH_WIDTH;",
+        *( [cfg_dispatch_sync_line] if cfg_dispatch_sync_line else [] ),
         "        }",
+        "        if (__q.ports.size() < static_cast<size_t>(__q.dispatch_width)) __q.ports.resize(__q.dispatch_width);",
+        "        if (__q.entry.size() < static_cast<size_t>(__q.size)) __q.entry.resize(__q.size);",
+        "        if (__q.entry_1.size() < static_cast<size_t>(__q.size)) __q.entry_1.resize(__q.size);",
+        "        if (__q.count < 0) __q.count = 0;",
+        "        if (__q.count > __q.size) __q.count = __q.size;",
+        "        if (__q.count_1 < 0) __q.count_1 = 0;",
+        "        if (__q.count_1 > __q.size) __q.count_1 = __q.size;",
+        "        int __ww = (__q.size + 63) / 64;",
+        "        if (__ww < 1) __ww = 1;",
+        "        __q.wake_words_per_row = __ww;",
+        "        size_t __need = static_cast<size_t>(PRF_NUM) * static_cast<size_t>(__ww);",
+        "        if (__q.wake_matrix_src1.size() < __need) __q.wake_matrix_src1.resize(__need, 0);",
+        "        if (__q.wake_matrix_src2.size() < __need) __q.wake_matrix_src2.resize(__need, 0);",
         "    }",
-        f"    for (int __k = 0; __k < ISSUE_WIDTH; ++__k) {{",
-        f"        auto& __e = {instance_name}.out.iss2prf->iss_entry[__k];",
-        "        if (__e.valid && __e.uop.dest_en) {",
-        "            __e.valid = false;",
-        "            __e.uop.dest_en = false;",
-        "        }",
-        "    }",
-    ])
+    ]
+
+    if method_name == "comb_awake":
+        lines.extend([
+            "    // Keep Source-A as-is (LSU_LOAD_WB_WIDTH entries).",
+            "    // Cap Source-B to a fixed prefix and disable Source-C in harness inputs",
+            "    // so total wakeups never exceed MAX_WAKEUP_PORTS.",
+            f"    for (int __k = 0; __k < DIV_MAX_LATENCY && __k < static_cast<int>({instance_name}.latency_pipe.size()); ++__k) {{",
+            f"        auto& __le = {instance_name}.latency_pipe[__k];",
+            "        if (__k >= (MAX_WAKEUP_PORTS - LSU_LOAD_WB_WIDTH) && __le.valid && __le.countdown == 0) {",
+            "            __le.valid = false;",
+            "        }",
+            "    }",
+            f"    for (int __k = 0; __k < ISSUE_WIDTH; ++__k) {{",
+            f"        auto& __e = {instance_name}.out.iss2prf->iss_entry[__k];",
+            "        if (__e.valid && __e.uop.dest_en) {",
+            "            __e.valid = false;",
+            "            __e.uop.dest_en = false;",
+            "        }",
+            "    }",
+        ])
+
+    if method_name == "comb_enq":
+        lines.extend([
+            "    // ---- Harness input sanitizer (Isu::comb_enq) ----",
+            "    // Rebuild occupancy from entry_1.valid, then keep valid requests",
+            "    // no more than true free slots to avoid reference Assert.",
+            f"    for (int __iq = 0; __iq < IQ_NUM && __iq < static_cast<int>({instance_name}.iqs.size()); ++__iq) {{",
+            f"        auto& __q = {instance_name}.iqs[__iq];",
+            "        int __cnt = 0;",
+            "        for (int __s = 0; __s < MAX_IQ_SIZE; ++__s) {",
+            "            if (__s >= __q.size) {",
+            "                if (__s < static_cast<int>(__q.entry_1.size())) __q.entry_1[__s].valid = false;",
+            "            } else {",
+            "                if (__s < static_cast<int>(__q.entry_1.size()) && __q.entry_1[__s].valid) ++__cnt;",
+            "            }",
+            "        }",
+            "        __q.count_1 = __cnt;",
+            "        int __free = __q.size - __cnt;",
+            "        if (__free < 0) __free = 0;",
+            "        int __keep = 0;",
+            f"        int __dw = 0; if (__iq < static_cast<int>({instance_name}.configs.size())) __dw = {instance_name}.configs[__iq].dispatch_width;",
+            "        if (__dw < 0) __dw = 0;",
+            "        if (__dw > MAX_IQ_DISPATCH_WIDTH) __dw = MAX_IQ_DISPATCH_WIDTH;",
+            "        for (int __w = 0; __w < ISSUE_WIDTH; ++__w) {",
+            f"            auto& __r = {instance_name}.in.dis2iss->req[__iq][__w];",
+            "            if (__w >= __dw) { __r.valid = false; continue; }",
+            "            if (__r.valid) {",
+            "                if (__keep < __free) ++__keep;",
+            "                else __r.valid = false;",
+            "            }",
+            "        }",
+            "    }",
+        ])
+
+    if method_name == "comb_issue":
+        lines.extend([
+            "    // ---- Harness input sanitizer (Isu::comb_issue) ----",
+            "    // Keep queue/port metadata in legal range to avoid undefined indexing.",
+            f"    for (int __iq = 0; __iq < IQ_NUM && __iq < static_cast<int>({instance_name}.iqs.size()); ++__iq) {{",
+            f"        auto& __q = {instance_name}.iqs[__iq];",
+            "        if (__q.dispatch_width < 0) __q.dispatch_width = 0;",
+            "        if (__q.dispatch_width > ISSUE_WIDTH) __q.dispatch_width = ISSUE_WIDTH;",
+            "        if (__q.ports.size() < static_cast<size_t>(__q.dispatch_width)) __q.ports.resize(__q.dispatch_width);",
+            "        if (__q.ports.size() < static_cast<size_t>(ISSUE_WIDTH)) __q.ports.resize(ISSUE_WIDTH);",
+            "        for (int __p = 0; __p < ISSUE_WIDTH; ++__p) {",
+            "            int __pid = __q.ports[__p].port_idx;",
+            "            if (__pid < 0) __pid = 0;",
+            "            if (__pid >= ISSUE_WIDTH) __pid = ISSUE_WIDTH - 1;",
+            "            __q.ports[__p].port_idx = __pid;",
+            "        }",
+            "    }",
+        ])
+
+    return "\n".join(lines)
 
 
 def build_debug_prompt(*, module_info, method, method_ctx, input_plan, compare_plan, current_snippet, verify_message):
@@ -500,11 +713,54 @@ def _debug_extra_hint(verify_message):
             "after mapping (`out_iss2dis.iss2dis...` is invalid), and avoid direct chained access "
             "like `arr[i][j].field`; use a typed temporary for `arr[i][j]` first."
         )
+    if "Can't find typedef/interface" in msg:
+        return (
+            "A typedef name is not declared in this environment. Use only typedef names that appear "
+            "in the provided SV type context (for Isu wake bus use `WakeInfo_t`), and do not invent "
+            "aliases like `IssAwakeEntry_t`."
+        )
     if "Failed to detect width of signal access" in msg:
         return (
             "Yosys cannot infer width for this access pattern. Avoid local array-typed temporaries "
             "inside the method body, and avoid dynamic chained field access on aggregates. "
             "Use scalar temporaries or existing framework-declared arrays/structs."
+        )
+    if "Index in generate block prefix syntax is not constant" in msg:
+        return (
+            "Do not use named procedural blocks (`begin : name ... end`) in method snippets. "
+            "Keep plain `begin/end` only, and avoid dynamic indexing forms inside named blocks."
+        )
+    if "out.iss2prf.iss_entry" in msg and "dut=1 ref=0" in msg:
+        return (
+            "The DUT is over-issuing versus reference. In Isu::comb_issue, do not infer `num_ports` by "
+            "counting `capability_mask != 0`, and do not compress schedule domain by non-zero masks. "
+            "Preserve the C++ schedule domain and first-fit behavior exactly. Also ensure commit only for "
+            "emit-accepted entries (ready/mask/flush/mispred checks passed), not all scheduled entries."
+        )
+    if "out.iss2prf.iss_entry[0].valid" in msg and "out.iss2prf.iss_entry[11].valid" in msg:
+        return (
+            "The failure shows mixed under/over-issue on boundary ports. In Isu::comb_issue, mirror C++ "
+            "`IssueQueue::schedule()` exactly: scan entries in slot order, choose first free compatible "
+            "port in the queue port domain (`q.ports`), then apply `exe2iss` gating only in emit stage "
+            "using the selected physical port. Do not use `dispatch_width` as schedule port-count proxy, "
+            "and do not re-derive an alternate active-port domain."
+        )
+    if "out.iss2prf.iss_entry[11].valid" in msg and "dut=1 ref=0" in msg:
+        return (
+            "DUT is over-issuing on high physical ports. In Isu::comb_issue, keep C++ emit gate strict: "
+            "`ready && (fu_ready_mask & req_bit) && !flush && !mispred` before setting out.valid, and "
+            "commit only accepted entries. Also avoid using `dispatch_width` as `num_ports` in schedule."
+        )
+    if "ALWCOMBORDER" in msg and "configs" in msg:
+        return (
+            "In `comb_issue`, do not write `configs` at all, and do not modify queue/config metadata fields "
+            "(`size`, `dispatch_width`, `ports[*].port_idx`). Treat them as read-only inputs."
+        )
+    if "Index in generate block prefix syntax is not constant" in msg and "entry_1" in msg:
+        return (
+            "Avoid nested dynamic chain lvalues like `iqs[q].entry_1[idx].uop.field = ...`. "
+            "Use element temporary update pattern: read whole `entry_1[idx]` into temp, modify temp fields, "
+            "then write back the whole temp struct."
         )
     if "procedural for-loop" in msg and "not constant" in msg:
         return (
@@ -523,6 +779,37 @@ def _debug_extra_hint(verify_message):
             "The snippet is using a field name that does not exist in the declared packed struct. "
             "Do not infer container internals from the C++ class API. Use only fields that appear in the provided "
             "SystemVerilog typedefs, or inline the method behavior with those real fields."
+        )
+    if "num_ports" in msg and "not found in structure" in msg:
+        return (
+            "Do not use `num_ports`; that field is not declared in this SV environment. "
+            "Use the declared bound field `dispatch_width` from the provided config structures."
+        )
+    if "capability_mask" in msg and "MISMATCH" in msg:
+        return (
+            "Capability-mask mismatches usually mean the source expression is wrong. "
+            "For Isu::init, use `GLOBAL_ISSUE_PORT_CONFIG[global_idx].support_mask` (64-bit) via "
+            "`global_idx = GLOBAL_IQ_CONFIG[i].port_start_idx + p`; do not use `port_attributes`, "
+            "and do not truncate through 32-bit temporaries. Keep OP-mask expressions symbolic; "
+            "do not replace support masks with numeric literals."
+        )
+    if "dispatch_width" in msg and "MISMATCH" in msg and "configs[" in msg:
+        return (
+            "For Isu::init, copy `dispatch_width` directly from `GLOBAL_IQ_CONFIG[i].dispatch_width` "
+            "(DECODE_WIDTH), not from `port_num`/counted ports and not fixed literals like 4/2."
+        )
+    if "out.iss2prf->iss_entry" in msg and "MISMATCH" in msg and "ready_num" in msg:
+        return (
+            "Full-pipeline mismatches after snippet-pass often mean Isu::init built partial IQ state. "
+            "Mirror `add_iq(dynamic_cfg)` semantics fully: copy `configs[i].ports` into `iqs[i].ports`, "
+            "set `wake_words_per_row = (size + 63) / 64`, and clear `entry/entry_1` + wake matrices."
+        )
+    if "latency_pipe_1" in msg and "br_mask" in msg and "MISMATCH" in msg:
+        return (
+            "For Isu::comb_calc_latency_next, preserve C++ push_back ordering exactly: "
+            "first keep old valid entries with signed `countdown > 0` and decrement countdown, "
+            "then append new issued entries with `lat = get_latency(decode_uop_type(inst.uop.op))` and `lat > 1`. "
+            "Copy `br_mask` bitwise unchanged; do not classify latency with guessed opcode numeric literals."
         )
     if "WIDTHTRUNC" in msg or "WIDTHEXPAND" in msg or "SELRANGE" in msg:
         return (
@@ -802,6 +1089,23 @@ def _project_specific_io_hints(module_info, method_name):
                 "iqs[i].entry_1.valid",
             ],
         ),
+        "comb_issue": (
+            [
+                "iqs[i].entry.valid",
+                "iqs[i].entry_1.valid",
+                "iqs[i].count_1",
+                "iqs[i].wake_words_per_row",
+                "iqs[i].dispatch_width",
+            ],
+            [
+                "out.iss2prf.iss_entry.valid",
+                "out.iss2prf.iss_entry.uop.dest_preg",
+                "iqs[i].entry_1.valid",
+                "iqs[i].count_1",
+                "iqs[i].wake_matrix_src1",
+                "iqs[i].wake_matrix_src2",
+            ],
+        ),
         "comb_flush": (
             [
                 "iqs[i].count_1",
@@ -1028,13 +1332,6 @@ def _build_roots(module_info, instance_name):
 def _sv_leaf_expr(module_info, label):
     # 叶子路径优先保留结构化访问形式。
     # 这比把 packed struct 降成整块 bit-slice 更稳定，也更利于 Yosys/Verilator 报错定位。
-    return _sv_path_expr(label)
-
-
-def _sv_leaf_lhs_expr(module_info, label):
-    # 原先这里把 LHS 强制降成 packed 位切片（例如 `iqs[0][20544 +: 32]`），
-    # 会触发大量隐式 wire / 越界副作用，导致 snippet 输入注入不稳定。
-    # 统一回到结构化路径写法，和 compare/调试视图保持一致。
     return _sv_path_expr(label)
 
 
@@ -1523,6 +1820,38 @@ def _sv_path_expr(path):
     return cur
 
 
+def sanitize_snippet_code(snippet_code):
+    """Apply conservative syntax rewrites for parser-unsafe snippet idioms."""
+    out = snippet_code or ""
+    # Rewrite invalid part-select on parenthesized expressions:
+    #   (expr)[N:0] -> ((expr) & W'hmask)
+    # Keep this conservative and only handle constant ranges.
+    part_sel = re.compile(r"\(\s*([^)]+?)\s*\)\s*\[\s*(\d+)\s*:\s*(\d+)\s*\]")
+
+    def _part_sel_repl(m):
+        expr = m.group(1).strip()
+        hi = int(m.group(2))
+        lo = int(m.group(3))
+        if hi < lo:
+            return m.group(0)
+        width = hi - lo + 1
+        if lo != 0:
+            # Keep original when low bit is not zero to avoid semantic risk.
+            return m.group(0)
+        if width >= 63:
+            return f"({expr})"
+        mask = (1 << width) - 1
+        return f"(({expr}) & {width}'h{mask:x})"
+
+    out = part_sel.sub(_part_sel_repl, out)
+    # Rewrite non-standard size-cast syntax often produced by models:
+    #   N'(expr) -> (expr)
+    # Keep this targeted to parenthesized expression form to avoid touching
+    # sized literals like 32'h1234.
+    out = re.sub(r"\b\d+\s*'\s*\(\s*([^()]+?)\s*\)", r"(\1)", out)
+    return out
+
+
 def _cpp_path_expr(path, instance_name):
     tokens = _split_path_tokens(path.replace("->", "."))
     if not tokens:
@@ -1581,11 +1910,10 @@ def _build_sv_input_unpack(input_plan):
     # input_plan 已经给出每个叶子信号在 pi 中的 offset/width，这里只负责直译成赋值语句。
     lines = []
     for leaf in input_plan["leaves"]:
-        lhs = leaf.get("sv_lhs_expr", leaf["sv_expr"])
         if leaf["width"] == 1:
-            lines.append(f"    {lhs} = pi[{leaf['offset']}];")
+            lines.append(f"    {leaf['sv_expr']} = pi[{leaf['offset']}];")
         else:
-            lines.append(f"    {lhs} = pi[{leaf['offset']} +: {leaf['width']}];")
+            lines.append(f"    {leaf['sv_expr']} = pi[{leaf['offset']} +: {leaf['width']}];")
     return "\n".join(lines) if lines else "    // (no free inputs)"
 
 

@@ -38,9 +38,17 @@ def setup_logger(name, log_dir, level=logging.DEBUG):
 
 def extract_verilog(text):
     """Extract verilog code block from LLM response."""
-    for tag in ["verilog", "systemverilog", "sv", ""]:
-        pat = rf"```{tag}\s*\n(.*?)```"
-        m = re.search(pat, text, re.DOTALL)
+    raw = text or ""
+    for tag in ["systemverilog", "verilog", "sv", ""]:
+        # Normal fenced block (with closing ```), allowing optional newline.
+        pat = rf"```{tag}\s*\n?(.*?)```"
+        matches = re.findall(pat, raw, re.DOTALL | re.IGNORECASE)
+        if matches:
+            return matches[-1].strip()
+
+        # Fallback: unclosed fenced block until end-of-text.
+        open_pat = rf"```{tag}\s*\n?(.*)$"
+        m = re.search(open_pat, raw, re.DOTALL | re.IGNORECASE)
         if m:
             return m.group(1).strip()
     return ""
@@ -84,4 +92,3 @@ def parse_cpp_header(path):
     body = func_match.group(1).strip()
 
     return {"pi_width": pi_width, "po_width": po_width, "body": body, "full": content}
-

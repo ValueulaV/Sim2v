@@ -127,6 +127,12 @@ def build_combined_module_sv(bf, combine_info, snippets, default_strategy="zero_
     ])
 
     for method_name in method_order:
+        # `init` is constructor-time logic in simulator wrappers (called once
+        # before per-cycle io_generator_outer flow), not per-cycle combinational
+        # logic. Keep it in prompt/snippet tasks, but do not inline it into the
+        # generated always_comb pipeline.
+        if method_name == "init":
+            continue
         task_key = f"{module_type}_{method_name}"
         if task_key not in snippets:
             continue

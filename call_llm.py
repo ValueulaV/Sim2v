@@ -12,10 +12,12 @@ import os
 import threading
 import time
 import hashlib
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openai import OpenAI
 from anthropic import Anthropic
+from anthropic import RateLimitError, APIConnectionError, APITimeoutError
 
 def _prompt_hash(messages):
     """Stable hash for a prompt message list."""
@@ -55,6 +57,27 @@ def ask_llm(provider, client, model_name, messages):
     return resp.choices[0].message.content
 
 
+def ask_llm_with_retry(provider, client, model_name, messages, logger, task,
+                       max_attempts=8, retry_interval_s=10.0):
+    """Provider call with bounded retry for transient/rate-limit failures."""
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return ask_llm(provider, client, model_name, messages)
+        except (RateLimitError, APIConnectionError, APITimeoutError) as e:
+            if attempt >= max_attempts:
+                logger.error(f"Task {task}: retry exhausted after {attempt} attempts ({type(e).__name__})")
+                raise
+            # Keep retry cadence short and stable to avoid long stalls.
+            # Add slight jitter so concurrent retries do not synchronize.
+            sleep_s = max(1.0, float(retry_interval_s)) * random.uniform(0.9, 1.1)
+            logger.warning(
+                f"Task {task}: transient {type(e).__name__}, retry {attempt}/{max_attempts} after {sleep_s:.1f}s"
+            )
+            time.sleep(sleep_s)
+
+
 def _process_entry(entry, provider, client, model_name, write_lock, out_file, logger,
                    record_dir=None):
     """Process one JSONL entry: call LLM and append result."""
@@ -67,7 +90,7 @@ def _process_entry(entry, provider, client, model_name, write_lock, out_file, lo
     logger.debug(f"Prompt hash: {phash}")
 
     # 这里的重试只处理“空响应”这种轻故障，不负责做复杂退避或 provider 级容错。
-    response = ask_llm(provider, client, model_name, messages)
+    response = ask_llm_with_retry(provider, client, model_name, messages, logger, task)
     retries = 0
     while not response or not response.strip():
         retries += 1
@@ -76,7 +99,7 @@ def _process_entry(entry, provider, client, model_name, write_lock, out_file, lo
             return
         time.sleep(2)
         logger.warning(f"Task {task}: empty response, retry {retries}")
-        response = ask_llm(provider, client, model_name, messages)
+        response = ask_llm_with_retry(provider, client, model_name, messages, logger, task)
 
     logger.info(f"Task {task}: got {len(response)} chars")
     logger.debug(f"Task {task}: response recorded={bool(record_dir)}")

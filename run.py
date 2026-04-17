@@ -163,6 +163,7 @@ def cmd_infer(cfg, logger, run_dir):
             if not code:
                 logger.warning(f"No verilog in response for {entry['task']}")
                 continue
+            code = snippet_stage.harness.sanitize_snippet_code(code)
             # 这里把 JSONL 响应再展开成单独的 .sv 文件，目的是让后续人工覆写、
             # snippet 调试和 combine 都只面向“最终 snippet 文件”，而不是直接回读 response JSON。
             vpath = os.path.join(snippet_dir, f"{entry['task']}.sv")

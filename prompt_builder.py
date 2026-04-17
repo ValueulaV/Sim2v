@@ -110,6 +110,21 @@ TRANSLATION_RULES = """\
 6g. Do not emit C++ container/member-method calls in SystemVerilog snippets.
     Names like `clear`, `push_back`, `reserve`, `resize`, `schedule`, `commit_issue`, `wakeup`, `tick`
     are C++ APIs, not synthesizable SV fields/methods in this framework.
+6h. For Isu methods with internal queue state (`comb_enq`, `comb_issue`):
+    preserve full C++ queue semantics, including side effects on dependency/wakeup bookkeeping
+    when the C++ method performs them.
+6i. For Isu `comb_issue`, preserve C++ scheduling + commit semantics exactly.
+    Do not simplify away intermediate state updates that affect later cycles.
+6j. For Isu `comb_enq`, preserve C++ enqueue semantics exactly, including dependency-matrix side effects.
+    Do not reduce behavior to only `entry_1.valid/count_1` updates.
+6k. Never reference undeclared members not present in provided SV declarations.
+    Forbidden guessed names include: `num_ports`, `port_num`, `queue_depth`, `cfg`.
+6l. For Isu queue scheduling methods, preserve C++ port-domain semantics exactly.
+    If C++ uses `ports.size()`, map it to the declared SV port-array domain with constant-bound loops
+    (typically `0..ISSUE_WIDTH-1`) plus guards as needed.
+    Do not invent undeclared `num_ports`/`port_num` fields.
+6m. If C++ source uses container size/length metadata, map it to the declared SV fields from context.
+    Do not invent parallel metadata fields with similar names.
 7. Preserve update semantics exactly:
    - `x++`, `++x`, `x += y`, `x--`, `--x`, `x -= y` update `x` itself.
    - If the C++ writes `x_1++`, translate that as an update to `x_1`, not `x`.
@@ -123,6 +138,7 @@ Output rules (STRICT):
 1. Output only statements valid inside an existing `always_comb` block.
 2. Do NOT output `always_*`, `module`, `typedef`, `function`, `localparam`, or `assign`.
    Do NOT output a top-level `begin : ...` / `begin ... end` wrapper for the whole method body.
+   Do NOT emit named procedural blocks (`begin : label ... end`) anywhere in the snippet.
 3. You MAY declare local variables if needed, but:
    - do not redeclare/shadow framework-declared signals/fields
    - declare locals at the top of the method body before executable statements
@@ -146,6 +162,178 @@ Output rules (STRICT):
 5a. Keep field comparisons width-consistent:
     if a field is declared 8-bit (e.g. `*_preg`), compare/assign with 8-bit temporaries or slices.
     Avoid widening one side to 32-bit unless the destination/operation truly requires 32-bit."""
+
+
+METHOD_EXTRA_RULES = {
+    ("Isu", "comb_issue"): """\
+Method-specific constraints:
+- The compare targets are issue outputs (`out_iss2prf.iss_entry[*]`) only.
+- Preserve full C++ `schedule()` + `commit_issue()` semantics, not a reduced approximation.
+- Preserve C++ active-port semantics (`ports.size()`) exactly.
+  In this fixed-array SV environment, model that domain with `ISSUE_WIDTH`-bounded
+  scanning over `q.ports[p]` (plus normal first-fit/compatibility guards).
+  Do not use `configs[i].dispatch_width` as a substitute for `q.ports.size()` in this method.
+- Preserve state-source semantics exactly:
+  - `schedule()` reads from `q.entry` (not `entry_1`);
+  - `commit_issue()` updates `q.entry_1` and wake matrices based on committed indices.
+- Preserve first-fit port binding semantics exactly:
+  scan active ports from low to high index and pick the first free compatible port, using
+  `q.ports[p].port_idx` and `q.ports[p].capability_mask` directly.
+- Preserve emit-stage port semantics exactly:
+  after schedule returns `<entry_idx, phys_port>`, all downstream checks/outputs must index by
+  `phys_port` (`in_exe2iss.ready[phys_port]`, `in_exe2iss.fu_ready_mask[phys_port]`,
+  `out_iss2prf.iss_entry[phys_port]`).
+  Never replace `phys_port` with schedule-loop indices (for example `p`, `issued_count`, or slot id).
+- Preserve acceptance semantics exactly:
+  only schedule results that pass emit-stage checks (`ready && fu_ready_mask bit && !flush && !mispred`)
+  are committed in this cycle. Do not clear `entry_1`/decrement `count_1` for schedule-only candidates.
+- Preserve commit read-source semantics exactly:
+  when deciding whether to clear an issued slot, read validity/dependency source from pre-commit
+  `entry_1` state for that same queue/slot (C++ `commit_issue` behavior).
+- Preserve resource accounting semantics:
+  increase `issued_count` and mark `port_busy[selected_port_idx]` only when a schedule candidate
+  is actually accepted into schedule result (selected port exists).
+  Do not consume port/issue budget for unscheduled entries.
+- Forbidden anti-patterns for this method:
+  - do not infer active port count by scanning `capability_mask != 0`.
+  - do not build ad-hoc physical-port packing tables (e.g. `port_to_entry_packed`).
+  - do not gate schedule selection directly by `exe2iss`; keep `exe2iss` checks in outer `comb_issue`
+    emit stage after `schedule()` result selection, exactly like C++.
+  - do not declare local array caches for scheduled/committed lists (examples: `sched_*[]`, `comm_*[]`,
+    `accepted[]`, `*_indices[]`). Use scalar temporaries or existing framework state only.
+  - do not declare any local unpacked arrays in this method (examples:
+    `logic port_busy [0:11]; integer sched_entry_idx [0:11];` are forbidden).
+  - do not index local arrays with runtime indices in this method.
+    If temporary list behavior is needed, encode with fixed scalar slots (`slot0..slot11`) and explicit guards.
+  - do not use dynamic chained field access on selected ports, such as
+    `q.ports[selected_port_idx].port_idx` or `tmp_q.ports[sel_port_idx].port_idx`.
+    Select the whole `PortBinding_t` into a temporary via constant-index `case`/guards first,
+    then read `tmp_port.port_idx`.
+  - do not write output fields through dynamic chained access such as
+    `out_iss2prf.iss_entry[phys_port].valid` or
+    `out_iss2prf.iss_entry[phys_port].uop.dest_preg`.
+    For emit stage, select whole `IssPrfEntry_t` by constant-index `case` into a temporary,
+    modify temporary fields, then write back the whole element with another constant-index `case`.
+  - do not write to `configs` in this method.
+  - do not mutate queue/config metadata fields in this method (`size`, `dispatch_width`, `ports[*].port_idx`);
+    treat them as inputs only. Update only outputs and C++-equivalent queue state side effects
+    (`out_iss2prf`, `entry_1`, `count_1`, wake matrices, committed indices buffer).
+  - do not write `committed_indices_buf` in this method; keep committed tracking in local scalar temporaries only.
+  - do not treat schedule result as committed by default.
+    In C++, schedule result is filtered by emit-stage backpressure and flush/mispred before commit.
+  - do not reuse the same loop variable name in nested loops (for example nested `for (i=...)` inside `for (i=...)`).
+    Each nested loop must use a unique iterator variable.
+""",
+    ("Isu", "comb_enq"): """\
+Method-specific constraints:
+- The compare targets are queue occupancy/valid bits (`iqs[*].entry_1[*].valid`, `iqs[*].count_1`).
+- Preserve conversion + wakeup-to-uop behavior for src busy bits before enqueue.
+- On enqueue success, write one slot in `entry_1`, set `valid`, and increment `count_1`.
+- Preserve enqueue side effects used by C++ queue model (including wake/dependency bookkeeping).
+- Use only typedef names declared in the provided SV environment.
+  Do not invent names like `IssAwakeEntry_t` or other undeclared aliases.
+- Enqueue guard must mirror C++ queue precondition and must not write past free slots.
+- Preserve enqueue search-domain semantics:
+  scan slots over `0 .. q.size-1` (not hardcoded ISSUE_WIDTH/MAX_PORT loops),
+  stop at first invalid slot, then set dependency bits for that exact slot.
+- Use declared wake entry type names only (for example `WakeInfo_t` for wake bus entries).
+  Do not invent aliases like `IssAwakeEntry_t`.
+""",
+    ("Isu", "comb_awake"): """\
+Method-specific constraints:
+- Use only typedef names declared in the provided SV environment.
+- Do not invent undeclared wake-entry type aliases.
+- Any loop over runtime counts (for example `preg_count`) must be rewritten as
+  constant-bound loops (`0..MAX_WAKEUP_PORTS-1` / fixed IQ/slot bounds) plus
+  internal `if (idx < runtime_count)` guards.
+- Do not assign nested dynamic chain lvalues such as
+  `iqs[q_idx].entry_1[slot_idx].uop.src1_busy = ...`.
+  Use temporary element update pattern only:
+  `tmp = iqs[q_idx].entry_1[slot_idx]; tmp.uop.src1_busy = ...; iqs[q_idx].entry_1[slot_idx] = tmp;`.
+""",
+    ("Isu", "init"): """\
+Method-specific constraints:
+- Translate C++ container-building logic into fixed-index SV initialization only.
+- Rebuild `configs[*]` from `GLOBAL_IQ_CONFIG` and `GLOBAL_ISSUE_PORT_CONFIG` exactly.
+- For each `configs[i].ports[p]`:
+  `port_idx = iq_cfg.port_start_idx + p`, `capability_mask = GLOBAL_ISSUE_PORT_CONFIG[port_idx].support_mask`.
+- Do not synthesize extra bit hacks/masks on `capability_mask`; keep direct table assignment semantics.
+- Preserve `support_mask` bit pattern exactly; do not approximate with guessed hex constants.
+- Set queue-side mirrors from config exactly: `iqs[i].id=size/dispatch_width` from the same config,
+  and initialize `count/count_1` to zero.
+- Preserve `add_iq(dynamic_cfg)` + `IssueQueue(cfg)` constructor semantics when building `iqs[i]`:
+  - copy `ports` from `dynamic_cfg.ports` into `iqs[i].ports` (same indices and masks);
+  - set `wake_words_per_row = (size + 63) / 64`;
+  - clear `entry/entry_1` valid state and clear wake matrices (`wake_matrix_src1/src2`).
+  Do not emit a partial IQ mirror that only writes id/size/dispatch/count fields.
+- Avoid any module-instance hardcoded masks or hand-copied tables.
+  Derive all `supported_ops`/`capability_mask` values only from the provided constants and source logic.
+- Do not emit manually guessed hex literals for `supported_ops`/`capability_mask` in this method.
+  Use table-driven expressions from provided global config context instead.
+- Do not use `port_attributes` as a source for `supported_ops` or `capability_mask` in this method.
+  Those values must come from global config tables (`GLOBAL_IQ_CONFIG`, `GLOBAL_ISSUE_PORT_CONFIG`) only.
+- `dispatch_width` must be copied from `GLOBAL_IQ_CONFIG[i].dispatch_width` exactly.
+  Do not derive `dispatch_width` from `port_num`, `ports.size`, or counted ports.
+  In this project `GLOBAL_IQ_CONFIG[i].dispatch_width == DECODE_WIDTH`; use `DECODE_WIDTH`
+  if needed, and never invent aliases like `GLOBAL_IQ_CONFIG_0_DISPATCH_WIDTH`.
+- Use symbolic OP masks exactly (no numeric replacement) for this method:
+  - Port0: `OP_MASK_ALU | OP_MASK_MUL | OP_MASK_CSR`
+  - Port1: `OP_MASK_ALU | OP_MASK_DIV`
+  - Port2: `OP_MASK_ALU | OP_MASK_FP`
+  - Port3: `OP_MASK_ALU`
+  - Port4/5: `OP_MASK_LD`
+  - Port6/7: `OP_MASK_STA`
+  - Port8/9: `OP_MASK_STD`
+  - Port10/11: `OP_MASK_BR`
+  and IQ supported ops:
+  - IQ_INT: `OP_MASK_ALU | OP_MASK_MUL | OP_MASK_DIV | OP_MASK_CSR`
+  - IQ_LD: `OP_MASK_LD`, IQ_STA: `OP_MASK_STA`, IQ_STD: `OP_MASK_STD`, IQ_BR: `OP_MASK_BR`.
+- Forbidden literalization in this method:
+  do not use numeric literals (such as `64'h...`, `64'd...`, `32'd4`) as replacements
+  for `supported_ops`, `capability_mask`, or `dispatch_width` assignments.
+- Forbidden invented constants in this method:
+  do not reference undeclared names like `GLOBAL_IQ_CONFIG_0_DISPATCH_WIDTH`,
+  `GLOBAL_IQ_CONFIG_1_DISPATCH_WIDTH`, etc.
+- Required implementation skeleton (must be semantically equivalent):
+  1) clear/reset `iqs`, `configs`, `latency_pipe`, `latency_pipe_1`, and `committed_indices_buf`.
+  2) loop `i` over IQs and set:
+     `configs[i].id/size/dispatch_width/supported_ops` directly from `GLOBAL_IQ_CONFIG[i]`.
+  3) inside each IQ, loop `p` over ports, compute `global_idx = iq_cfg.port_start_idx + p`,
+     then assign:
+     `configs[i].ports[p].port_idx = global_idx;`
+     `configs[i].ports[p].capability_mask = GLOBAL_ISSUE_PORT_CONFIG[global_idx].support_mask;`
+  4) assign `iqs[i].id/size/dispatch_width` from `configs[i]` and zero `count/count_1`.
+- Forbidden anti-patterns for this method:
+  `capability_mask = {32'd0, port_attributes[...]}` (forbidden),
+  `supported_ops` built from `port_attributes` (forbidden),
+  `dispatch_width = 4/2/port_num` style derived constants (forbidden).
+- Literal token guard for this method:
+  the final SV snippet must not contain the token `port_attributes` anywhere.
+  If you rely on `port_attributes` textually, the translation is considered incorrect.
+""",
+    ("Isu", "comb_calc_latency_next"): """\
+Method-specific constraints:
+- Compare targets focus on `latency_pipe_1[*].br_mask`; preserve exact C++ two-phase behavior:
+  1) clear next-state, copy valid old entries with countdown>0 and decrement countdown;
+  2) append new issued entries with `lat = get_latency(decode_uop_type(op))`, and only if `lat > 1`.
+- For new entries, copy `br_mask` directly from `out_iss2prf.iss_entry[i].uop.br_mask` without modification.
+- Use existing keyword-escaped field names from SV context exactly (e.g. `type_v` if present).
+- In phase (1), preserve old-entry `br_mask` bitwise exactly when copying to next-state.
+- Do not alter or re-encode `br_mask` in either phase.
+- This method must not write `out_iss2prf` or any input interface signals.
+- Match C++ signed-int semantics for `countdown`:
+  evaluate old-entry keep condition as signed (`countdown > 0` in C++ int sense), then decrement by 1.
+  Do not treat `countdown` as unsigned for this condition.
+- Keep latency classification semantically equivalent to helper calls:
+  `lat = get_latency(decode_uop_type(inst.uop.op))`.
+  Do not replace this with guessed opcode-id literals (for example `op==13/14`) or ad-hoc tables.
+- Forbidden patterns for this method:
+  `if (entry.countdown > 32'h0)` or other unsigned-only comparisons on `countdown`,
+  and any rewrite that can reorder preserved old entries relative to C++ push-back order.
+- Do not emulate push-back with `for (w=0;w<N;w++) if (w==lp1_idx) ...` gated writes.
+  Use direct `latency_pipe_1[lp1_idx]` read/modify/write with a typed temporary.
+""",
+}
 
 
 METHOD_PROMPT_TEMPLATE = """\
@@ -316,6 +504,17 @@ def _select_sv_constants(all_constants, text):
     return used
 
 
+def _all_sv_constants(all_constants):
+    """Return all constants that can be safely lowered to SV literals."""
+    used = []
+    for name, value in sorted(all_constants.items()):
+        lowered = _lower_sv_constant_expr(value, KNOWN_CONSTANTS)
+        if lowered is None:
+            continue
+        used.append((name, lowered))
+    return used
+
+
 def select_prompt_constants(all_constants, text):
     return {name: value for name, value in _select_sv_constants(all_constants, text)}
 
@@ -373,6 +572,11 @@ def render_method_prompt(
         )
     else:
         type_defs_section = ""
+    extra_method_rules = METHOD_EXTRA_RULES.get((module_type, method_name), "").strip()
+    translation_rules = TRANSLATION_RULES
+    if extra_method_rules:
+        translation_rules = f"{TRANSLATION_RULES}\n{extra_method_rules}"
+
     return METHOD_PROMPT_TEMPLATE.format(
         role_intro=role_intro,
         module_type=module_type,
@@ -394,7 +598,7 @@ def render_method_prompt(
         internal_vars="\n".join(internal_vars),
         helpers_section=_format_helpers(method_helpers),
         method_body=method_body,
-        translation_rules=TRANSLATION_RULES,
+        translation_rules=translation_rules,
         output_block=output_block,
         output_constraints=OUTPUT_CONSTRAINTS,
     )
@@ -504,6 +708,19 @@ def _parse_comb_call_order_from_outer(header_text):
     if m:
         region = m.group(1)
 
+    # Ignore commented-out pseudo calls (for example `// isu.init();`) so we only
+    # keep real executable calls from the wrapper body.
+    region = re.sub(r"/\*.*?\*/", "", region, flags=re.DOTALL)
+    cleaned_lines = []
+    for line in region.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("//"):
+            continue
+        if "//" in line:
+            line = line.split("//", 1)[0]
+        cleaned_lines.append(line)
+    region = "\n".join(cleaned_lines)
+
     calls = re.findall(
         r"(?:\.|->)\s*((?:init|comb_[A-Za-z0-9_]+))\s*\(\s*\)\s*;",
         region,
@@ -528,7 +745,18 @@ def resolve_active_method_order(module_info, outer_header_text=None):
         outer_order = _parse_comb_call_order_from_outer(outer_header_text)
         if outer_order:
             parsed_set = set(parsed_method_order)
-            return [m for m in outer_order if m in parsed_set]
+            active_order = [m for m in outer_order if m in parsed_set]
+            # Keep init task generation stable even when wrapper call is absent/commented.
+            # Downstream stages rely on init for table-driven state/config construction.
+            if "init" in parsed_set and "init" not in active_order:
+                init_pos = parsed_method_order.index("init")
+                insert_pos = len(active_order)
+                for idx, name in enumerate(active_order):
+                    if parsed_method_order.index(name) > init_pos:
+                        insert_pos = idx
+                        break
+                active_order.insert(insert_pos, "init")
+            return active_order
     return parsed_method_order
 
 
@@ -566,8 +794,10 @@ def get_combine_info(bsd_dir, base_dir=".", mapping_provider=None):
     )
     var_decls = generate_sv_var_declarations(module_info["structs"], module_type)
     all_constants = parse_all_constants()
-    logic_text = module_info.get("logic_source", "")
-    used_constants = _select_sv_constants(all_constants, logic_text)
+    # combine/snippet wrappers should be robust to model-generated references
+    # to project constants that may not appear in the extracted logic text.
+    # Emit all safely-lowerable constants to avoid undefined symbol compile errors.
+    used_constants = _all_sv_constants(all_constants)
 
     pi_lines = mapping_provider.generate_pi_sv(module_info["inputs"])
     pi_code = "\n".join(pi_lines)
@@ -643,13 +873,9 @@ def build_prompts(input_dirs, output_path, base_dir=".", struct_expand_depth=2,
                     module_info["structs"], module_info["type_widths"],
                     ordered_structs=ordered,
                 )
-                cpp_type_sources = generate_cpp_type_sources(
-                    module_info.get("struct_sources", {}),
-                    ordered,
-                )
                 entry = build_subtask_prompt(
                     method, helpers_db, all_constants, module_info,
-                    cpp_type_sources, sv_typedefs, var_decls, infer_use_think=infer_use_think,
+                    "", sv_typedefs, var_decls, infer_use_think=infer_use_think,
                 )
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 count += 1

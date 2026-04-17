@@ -4,6 +4,7 @@ import os
 import threading
 import time
 import math
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -169,15 +170,6 @@ def run(cfg, logger, run_dir, target=None):
             compare_labels = [leaf.get("label") for leaf in compare_plan["leaves"] if leaf.get("label")]
             if method["name"] != "init":
                 input_plan = harness.drop_leaves_from_plan(input_plan, compare_labels)
-            if method["name"] == "init" and input_targets:
-                input_targets = []
-                input_plan = harness.build_signal_plan(
-                    module_info,
-                    input_targets,
-                    instance_name,
-                    loop_domains=loop_domains,
-                    respect_dependencies=True,
-                )
 
             task_dir = os.path.join(out_dir, task_name)
             os.makedirs(task_dir, exist_ok=True)
@@ -268,6 +260,8 @@ def _run_one_method(*, cfg, logger, provider, client, task_dir, module_info,
                 snippet_code = f.read().strip()
             harness.write_text(os.path.join(step_dir, "snippet_before.sv"), snippet_code + "\n")
 
+            static_fail = _snippet_static_guard(module_info["module_type"], method["name"], snippet_code)
+
             module_name = f"snippet_{module_info['module_type'].lower()}_{method['name']}"
             # 单方法验证依赖一对对称的产物：
             # - SV wrapper：把当前 snippet 放进可编译可验证的 always_comb 壳里
@@ -295,25 +289,36 @@ def _run_one_method(*, cfg, logger, provider, client, task_dir, module_info,
 
             # verify 的 shard 数是动态分配的。
             # 这里不要把 requested_parallel_jobs 理解成“固定值”，它只是单 method 想要的上限。
-            granted_parallel_jobs = shard_budget.acquire(requested_parallel_jobs)
-            try:
-                verify_start = time.perf_counter()
-                passed, message = verifier.verify(
-                    ref_path,
-                    sv_code,
-                    module_name,
-                    input_plan["pi_width"],
-                    compare_plan["po_width"],
-                    cfg["verify"]["exhaustive_threshold"],
-                    snippet_max_test_vectors,
-                    output_signal_map=compare_plan["signal_map"],
-                    verilator_bin=cfg["verilator"],
-                    yosys_bin=cfg.get("yosys"),
-                    parallel_jobs=granted_parallel_jobs,
-                )
-                verify_elapsed = time.perf_counter() - verify_start
-            finally:
-                shard_budget.release(granted_parallel_jobs)
+            if static_fail:
+                passed = False
+                message = "STATIC_GUARD_FAIL:\n" + static_fail
+                verify_elapsed = 0.0
+                granted_parallel_jobs = 0
+            else:
+                granted_parallel_jobs = shard_budget.acquire(requested_parallel_jobs)
+                try:
+                    verify_start = time.perf_counter()
+                    verify_exhaustive_threshold = int(cfg["verify"]["exhaustive_threshold"])
+                    if method["name"] == "init":
+                        # Keep init on randomized/fixed-count vectors instead of 2^pi_width exhaustive mode.
+                        # init often has tiny pi_width in snippet harness, which otherwise collapses to 2 vectors.
+                        verify_exhaustive_threshold = 0
+                    passed, message = verifier.verify(
+                        ref_path,
+                        sv_code,
+                        module_name,
+                        input_plan["pi_width"],
+                        compare_plan["po_width"],
+                        verify_exhaustive_threshold,
+                        snippet_max_test_vectors,
+                        output_signal_map=compare_plan["signal_map"],
+                        verilator_bin=cfg["verilator"],
+                        yosys_bin=cfg.get("yosys"),
+                        parallel_jobs=granted_parallel_jobs,
+                    )
+                    verify_elapsed = time.perf_counter() - verify_start
+                finally:
+                    shard_budget.release(granted_parallel_jobs)
 
             full_compile_elapsed = 0.0
             if passed:
@@ -366,11 +371,13 @@ def _run_one_method(*, cfg, logger, provider, client, task_dir, module_info,
             )
             harness.write_text(os.path.join(step_dir, "prompt.txt"), prompt)
             llm_start = time.perf_counter()
-            response = call_llm.ask_llm(
+            response = call_llm.ask_llm_with_retry(
                 provider,
                 client,
                 cfg["llm"]["model"],
                 [{"role": "user", "content": prompt}],
+                logger=logger,
+                task=f"{module_info['module_type']}_{method['name']}_debug_step_{step_idx}",
             )
             llm_elapsed = time.perf_counter() - llm_start
             harness.write_text(os.path.join(step_dir, "response.txt"), response or "")
@@ -380,6 +387,7 @@ def _run_one_method(*, cfg, logger, provider, client, task_dir, module_info,
             )
             answer = extract_model_payload(response or "", debug_use_think)
             patched = extract_verilog(answer)
+            patched = harness.sanitize_snippet_code(patched)
             if not patched.strip():
                 return {"passed": False, "step": step_idx, "stop_reason": "empty_patch", "task_dir": task_dir}
             if patched.strip() == snippet_code.strip():
@@ -390,6 +398,53 @@ def _run_one_method(*, cfg, logger, provider, client, task_dir, module_info,
         return {"passed": False, "step": max_iterations, "stop_reason": "max_iterations", "task_dir": task_dir}
     finally:
         shard_budget.finish_method()
+
+
+def _snippet_static_guard(module_type, method_name, snippet_code):
+    """Fast reject for clearly invalid snippet patterns before heavy verify."""
+    if module_type != "Isu" or method_name != "comb_issue":
+        return None
+
+    src = snippet_code or ""
+    findings = []
+
+    assign = r"(?:<=|(?<![=!<>])=(?!=))"
+    forbidden_lhs = [
+        r"configs\s*\[[^\]]+\]\s*\.[A-Za-z_]\w*",
+        r"iqs\s*\[[^\]]+\]\s*\.size",
+        r"iqs\s*\[[^\]]+\]\s*\.dispatch_width",
+        r"iqs\s*\[[^\]]+\]\s*\.ports\s*\[[^\]]+\]\s*\.port_idx",
+        r"iqs\s*\[[^\]]+\]\s*\.entry\s*\[[^\]]+\]\s*\.valid",
+        r"iqs\s*\[[^\]]+\]\s*\.entry\s*\[[^\]]+\]\s*\.uop\.",
+    ]
+    for lhs in forbidden_lhs:
+        if re.search(rf"{lhs}\s*{assign}", src):
+            findings.append(f"forbidden write matched: `{lhs}`")
+
+    # In this framework comb_issue should not reference global init tables directly.
+    if "GLOBAL_IQ_CONFIG" in src or "GLOBAL_ISSUE_PORT_CONFIG" in src:
+        findings.append("comb_issue must not reference GLOBAL_* config tables")
+
+    # Reject the known bad pattern: inferring active port count by non-zero capability masks.
+    if re.search(r"\bcapability_mask\s*!=\s*(?:64'd0|0)\b", src):
+        findings.append("do not infer active port count by scanning `capability_mask != 0`")
+    if re.search(r"\bcfg_cap\s*!=\s*(?:64'd0|0)\b", src):
+        findings.append("do not infer active port count by scanning temporary capability masks")
+    if re.search(r"\bif\s*\([^)]*cap(?:ability)?_mask[^)]*!=\s*(?:64'd0|0)[^)]*\)\s*num_ports\w*\s*=", src):
+        findings.append("do not increment `num_ports` from capability-mask non-zero checks")
+    if re.search(r"\bif\s*\([^)]*cfg_cap[^)]*!=\s*(?:64'd0|0)[^)]*\)\s*num_ports\w*\s*=", src):
+        findings.append("do not increment `num_ports` from cfg_cap non-zero checks")
+    if re.search(r"\bnum_ports\w*\s*=\s*[^;\n]*dispatch_width\b", src):
+        findings.append("do not derive `num_ports` from `dispatch_width` in comb_issue schedule domain")
+
+    if not findings:
+        return None
+    return (
+        "The snippet is changing read-only metadata/state source for `Isu::comb_issue`.\n"
+        "Fix by keeping schedule source on `q.entry`, commit side effects on `entry_1/count_1/wake_matrix`, "
+        "and avoid writing `configs`/queue metadata.\n"
+        + "\n".join(f"- {x}" for x in findings)
+    )
 
 
 def _build_method_context(module_info, combine_info, helper_db, all_constants):
