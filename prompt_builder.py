@@ -346,10 +346,12 @@ Method-specific constraints:
 - Preserve C++ `flush_br` / `clear_br` / latency-pipe behavior exactly.
 - On `in.rob_bcast->flush`, clear all `iqs[*].entry_1[*].valid`, reset `count_1`,
   clear wake matrices, and clear both `latency_pipe` and `latency_pipe_1`.
-- Queue slot loops for this method are over the IQ storage size (`q.size`, up to 64 here),
-  not over `ISSUE_WIDTH` / issue-port count. Never use 12 as the bound for `entry_1` traversal.
-- `flush_all()` / `flush_br()` / `clear_br()` semantics all iterate queue slots by queue size.
-  If you write `for (...) entry_1[i] ...`, the bound must cover every queue slot, not only ports.
+- `flush_all()` has full-storage semantics: it clears every slot in `entry_1` (all 64 slots here),
+  independent of runtime `q.size`. Do NOT guard flush-all slot clearing with `i < q.size`.
+- Queue slot loops for this method are over IQ storage slots (up to 64 here), not over
+  `ISSUE_WIDTH` / issue-port count. Never use 12 as the bound for `entry_1` traversal.
+- `flush_br()` / `clear_br()` iterate `0..q.size-1` exactly (runtime queue size domain),
+  while `flush_all()` clears the whole storage domain. Keep this distinction exactly.
 - On `in.dec_bcast->mispred`, queue-side behavior must match C++ `flush_br(br_mask)` exactly.
 - In queue-side `flush_br(br_mask)`, for each matching valid slot:
   clear dependency bits for that exact slot index, then clear `entry_1[i].valid`, then decrement `count_1`.
