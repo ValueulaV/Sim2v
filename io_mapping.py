@@ -536,11 +536,11 @@ class MappingProvider:
     def collect_outputs(self, bsd_dir, module_type, cpp_source):
         return collect_outputs(bsd_dir, module_type, cpp_source)
 
-    def generate_pi_sv(self, inputs):
-        return cpp_helpers.generate_pi_sv(inputs)
+    def generate_pi_sv(self, inputs, max_width=None):
+        return cpp_helpers.generate_pi_sv(inputs, max_width=max_width)
 
-    def generate_po_sv(self, output_signals):
-        return cpp_helpers.generate_po_sv(output_signals)
+    def generate_po_sv(self, output_signals, max_width=None):
+        return cpp_helpers.generate_po_sv(output_signals, max_width=max_width)
 
 
 _PROVIDERS = {

@@ -394,6 +394,13 @@ def _prepare_verify_cpp_path(cpp_path, module_name, run_dir, logger):
     if not inst_match:
         return cpp_path
     inst = inst_match.group(1)
+    pi_width_match = re.search(r"\bPI_WIDTH\s*=\s*(\d+)\s*;", text)
+    po_width_match = re.search(r"\bPO_WIDTH\s*=\s*(\d+)\s*;", text)
+    if not pi_width_match or not po_width_match:
+        return cpp_path
+    pi_width = int(pi_width_match.group(1))
+    po_width = int(po_width_match.group(1))
+
     anchor = f"{inst}.pi_to_simulator(pi);"
     if anchor not in text:
         return cpp_path
@@ -401,21 +408,31 @@ def _prepare_verify_cpp_path(cpp_path, module_name, run_dir, logger):
     patched = text
     marker_pre = "// SIM2V_VERIFY_REF_FIX_ISU_LAT_PIPE_PRE_PI"
     if marker_pre not in patched:
+        # Isu pi_to_simulator in some wrappers can consume more bits than PI_WIDTH.
+        # Extend with zero-padded shadow input to avoid OOB reads and keep deterministic semantics.
+        safe_extra = 4096
+        safe_pi_width = pi_width + safe_extra
         injected_pre = [
             f"    {marker_pre}",
             f"    if ({inst}.latency_pipe.size() < DIV_MAX_LATENCY) {inst}.latency_pipe.resize(DIV_MAX_LATENCY);",
             f"    if ({inst}.latency_pipe_1.size() < DIV_MAX_LATENCY) {inst}.latency_pipe_1.resize(DIV_MAX_LATENCY);",
-            f"    {anchor}",
+            f"    bool sim2v_verify_pi_safe[{safe_pi_width}] = {{0}};",
+            f"    for (int sim2v_i = 0; sim2v_i < PI_WIDTH; ++sim2v_i) sim2v_verify_pi_safe[sim2v_i] = pi[sim2v_i];",
+            f"    {inst}.pi_to_simulator(sim2v_verify_pi_safe);",
         ]
         patched = patched.replace(anchor, "\n".join(injected_pre), 1)
 
     anchor_po = f"{inst}.simulator_to_po(po);"
     marker_po = "// SIM2V_VERIFY_REF_FIX_ISU_LAT_PIPE_PRE_PO"
     if anchor_po in patched and marker_po not in patched:
+        safe_extra = 4096
+        safe_po_width = po_width + safe_extra
         injected_po = [
             f"    {marker_po}",
             f"    if ({inst}.latency_pipe_1.size() < DIV_MAX_LATENCY) {inst}.latency_pipe_1.resize(DIV_MAX_LATENCY);",
-            f"    {anchor_po}",
+            f"    bool sim2v_verify_po_safe[{safe_po_width}] = {{0}};",
+            f"    {inst}.simulator_to_po(sim2v_verify_po_safe);",
+            f"    for (int sim2v_i = 0; sim2v_i < PO_WIDTH; ++sim2v_i) po[sim2v_i] = sim2v_verify_po_safe[sim2v_i];",
         ]
         patched = patched.replace(anchor_po, "\n".join(injected_po), 1)
 

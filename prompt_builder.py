@@ -847,14 +847,18 @@ def get_combine_info(bsd_dir, base_dir=".", mapping_provider=None):
     # Emit all safely-lowerable constants to avoid undefined symbol compile errors.
     used_constants = _all_sv_constants(all_constants)
 
-    pi_lines = mapping_provider.generate_pi_sv(module_info["inputs"])
+    pi_lines = mapping_provider.generate_pi_sv(
+        module_info["inputs"], max_width=module_info["pi_width"]
+    )
     pi_code = "\n".join(pi_lines)
 
     bsd_entries = []
     for bf in module_info["bsd_files"]:
         module_name = os.path.splitext(bf["filename"])[0]
         out_signals = [{"path": sig, "width": w} for sig, w in bf["unpack_lines"]]
-        po_lines = mapping_provider.generate_po_sv(out_signals)
+        po_lines = mapping_provider.generate_po_sv(
+            out_signals, max_width=bf["po_width"]
+        )
 
         bsd_entries.append({
             "module_name": module_name,

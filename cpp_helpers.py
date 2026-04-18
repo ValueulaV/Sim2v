@@ -12,18 +12,27 @@ def _pi_path_to_sv(path, idx=None):
     return sv
 
 
-def generate_pi_sv(inputs):
+def generate_pi_sv(inputs, max_width=None):
     """Generate SV input extraction assignments from pi[] into struct variables."""
     lines = []
     for inp in inputs:
-        width = inp["width"]
+        width = int(inp["width"])
         for idx in range(inp["count"]):
             sv_path = _pi_path_to_sv(inp["path"], idx if inp["count"] > 1 else None)
             bit_start = inp["offset"] + idx * width
-            if width == 1:
+            emit_width = width
+            if max_width is not None:
+                limit = int(max_width)
+                if bit_start >= limit:
+                    continue
+                if bit_start + emit_width > limit:
+                    emit_width = limit - bit_start
+                    if emit_width <= 0:
+                        continue
+            if emit_width == 1:
                 lines.append(f"    {sv_path} = pi[{bit_start}];")
             else:
-                lines.append(f"    {sv_path} = pi[{bit_start + width - 1}:{bit_start}];")
+                lines.append(f"    {sv_path} = pi[{bit_start + emit_width - 1}:{bit_start}];")
     return lines
 
 
@@ -34,16 +43,23 @@ def _po_path_to_sv(path):
     return cpp_path_to_sv(path)
 
 
-def generate_po_sv(output_signals):
+def generate_po_sv(output_signals, max_width=None):
     """Generate SV output packing assignments from struct variables to po[]."""
     lines = []
     offset = 0
     for out in output_signals:
         sv_path = _po_path_to_sv(out["path"])
-        width = out["width"]
-        if width == 1:
+        width = int(out["width"])
+        if max_width is not None and offset >= int(max_width):
+            break
+        emit_width = width
+        if max_width is not None and offset + emit_width > int(max_width):
+            emit_width = int(max_width) - offset
+            if emit_width <= 0:
+                break
+        if emit_width == 1:
             lines.append(f"    po[{offset}] = {sv_path};")
         else:
-            lines.append(f"    po[{offset + width - 1}:{offset}] = {sv_path};")
+            lines.append(f"    po[{offset + emit_width - 1}:{offset}] = {sv_path};")
         offset += width
     return lines
