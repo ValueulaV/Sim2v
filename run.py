@@ -287,7 +287,8 @@ def cmd_verify(cfg, logger, run_dir, target=None):
                 logger.warning(f"No cpp reference for {name}")
                 continue
 
-            info = parse_cpp_header(cpp_path)
+            verify_cpp_path = _prepare_verify_cpp_path(cpp_path, name, run_dir, logger)
+            info = parse_cpp_header(verify_cpp_path)
             # output_signal_map 决定了 testbench 在 mismatch 时如何把 bit 位置反查成语义化信号名。
             # 没有它也能验证，但报错会退化成“第 N bit 错”，调试体验会差很多。
             output_signal_map = _build_output_signal_map(cpp_path, name, mapping_provider)
@@ -296,7 +297,7 @@ def cmd_verify(cfg, logger, run_dir, target=None):
 
             logger.info(f"Verifying {name} ({source})...")
             passed, msg = verifier.verify(
-                cpp_path, verilog_code, name,
+                verify_cpp_path, verilog_code, name,
                 info["pi_width"], info["po_width"],
                 vcfg["exhaustive_threshold"],
                 vcfg["max_test_vectors"],
@@ -375,6 +376,56 @@ def _build_output_signal_map(cpp_path, module_name, mapping_provider):
                 offset += int(width)
             return signal_map
     return None
+
+
+def _prepare_verify_cpp_path(cpp_path, module_name, run_dir, logger):
+    """Build a verify-only wrapper copy when original wrapper has fragile init state."""
+    try:
+        with open(cpp_path) as f:
+            text = f.read()
+    except OSError:
+        return cpp_path
+
+    # Keep default behavior for non-Isu wrappers.
+    if "#include <Isu.h>" not in text:
+        return cpp_path
+
+    inst_match = re.search(r"\bIsu\s+([A-Za-z_]\w*)\s*\(&ctx\)\s*;", text)
+    if not inst_match:
+        return cpp_path
+    inst = inst_match.group(1)
+    anchor = f"{inst}.pi_to_simulator(pi);"
+    if anchor not in text:
+        return cpp_path
+
+    patched = text
+    marker_pre = "// SIM2V_VERIFY_REF_FIX_ISU_LAT_PIPE_PRE_PI"
+    if marker_pre not in patched:
+        injected_pre = [
+            f"    {marker_pre}",
+            f"    if ({inst}.latency_pipe.size() < DIV_MAX_LATENCY) {inst}.latency_pipe.resize(DIV_MAX_LATENCY);",
+            f"    if ({inst}.latency_pipe_1.size() < DIV_MAX_LATENCY) {inst}.latency_pipe_1.resize(DIV_MAX_LATENCY);",
+            f"    {anchor}",
+        ]
+        patched = patched.replace(anchor, "\n".join(injected_pre), 1)
+
+    anchor_po = f"{inst}.simulator_to_po(po);"
+    marker_po = "// SIM2V_VERIFY_REF_FIX_ISU_LAT_PIPE_PRE_PO"
+    if anchor_po in patched and marker_po not in patched:
+        injected_po = [
+            f"    {marker_po}",
+            f"    if ({inst}.latency_pipe_1.size() < DIV_MAX_LATENCY) {inst}.latency_pipe_1.resize(DIV_MAX_LATENCY);",
+            f"    {anchor_po}",
+        ]
+        patched = patched.replace(anchor_po, "\n".join(injected_po), 1)
+
+    ref_dir = os.path.join(run_dir, "verify_refs")
+    os.makedirs(ref_dir, exist_ok=True)
+    ref_path = os.path.join(ref_dir, f"{module_name}_verify_ref.h")
+    with open(ref_path, "w") as f:
+        f.write(patched)
+    logger.info(f"Using verify-only reference wrapper: {ref_path}")
+    return ref_path
 
 def main():
     # run_dir 的复用规则：

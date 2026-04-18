@@ -164,12 +164,17 @@ def run(cfg, logger, run_dir, target=None):
                 logger.warning(f"Skip {task_name}: compare plan resolved to empty leaves")
                 continue
             # 避免把 compare 目标回灌成 snippet 自由输入。
-            # 这会诱导模型“读当前 out 再写 out”，并显著放大 input harness 规模。
-            # 对 init 这类“大量输出需要在方法内构造”的初始化方法，保留输出回灌输入，
-            # 否则会把关键配置常量全部移掉，难以复现 C++ 初始化语义。
+            # 默认策略：删除全部重叠 compare 标签，降低“读当前输出再写输出”的投机实现风险。
+            # 特例：Isu::comb_flush 需要读旧状态再写回同一结构（尤其 latency_pipe_1.*），
+            # 这里只删除 out.* 重叠，保留内部状态重叠输入。
+            # 对 init 这类初始化方法，仍保留全部回灌输入。
             compare_labels = [leaf.get("label") for leaf in compare_plan["leaves"] if leaf.get("label")]
             if method["name"] != "init":
-                input_plan = harness.drop_leaves_from_plan(input_plan, compare_labels)
+                blocked_labels = compare_labels
+                if module_info.get("module_type") == "Isu" and method["name"] == "comb_flush":
+                    blocked_labels = [label for label in compare_labels if label.startswith("out.")]
+                if blocked_labels:
+                    input_plan = harness.drop_leaves_from_plan(input_plan, blocked_labels)
 
             task_dir = os.path.join(out_dir, task_name)
             os.makedirs(task_dir, exist_ok=True)

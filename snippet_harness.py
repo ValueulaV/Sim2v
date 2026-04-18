@@ -537,13 +537,37 @@ def _build_sv_input_sanitizer(module_type, method_name):
     if method_name == "comb_issue":
         lines.extend([
             "    // ---- Harness input sanitizer (Isu::comb_issue) ----",
-            "    // Keep queue/port metadata in legal range to avoid undefined indexing.",
+            "    // Keep queue/port metadata in legal range to avoid C++/SV domain divergence.",
             "    for (int __iq = 0; __iq < IQ_NUM; __iq++) begin",
+            "        int __size_v;",
+            "        int __cnt_v;",
             "        int __dw_v;",
+            "        int __ww_v;",
+            "        __size_v = iqs[__iq].size;",
+            "        if (__size_v < 0) __size_v = 0;",
+            "        if (__size_v > MAX_IQ_SIZE) __size_v = MAX_IQ_SIZE;",
+            "        iqs[__iq].size = __size_v;",
+            "        __cnt_v = iqs[__iq].count;",
+            "        if (__cnt_v < 0) __cnt_v = 0;",
+            "        if (__cnt_v > __size_v) __cnt_v = __size_v;",
+            "        iqs[__iq].count = __cnt_v;",
+            "        __cnt_v = iqs[__iq].count_1;",
+            "        if (__cnt_v < 0) __cnt_v = 0;",
+            "        if (__cnt_v > __size_v) __cnt_v = __size_v;",
+            "        iqs[__iq].count_1 = __cnt_v;",
             "        __dw_v = iqs[__iq].dispatch_width;",
             "        if (__dw_v < 0) __dw_v = 0;",
             "        if (__dw_v > ISSUE_WIDTH) __dw_v = ISSUE_WIDTH;",
             "        iqs[__iq].dispatch_width = __dw_v;",
+            "        __ww_v = (__size_v + 63) / 64;",
+            "        if (__ww_v < 1) __ww_v = 1;",
+            "        iqs[__iq].wake_words_per_row = __ww_v;",
+            "        for (int __s = 0; __s < MAX_IQ_SIZE; __s++) begin",
+            "            if (__s >= __size_v) begin",
+            "                iqs[__iq].entry[__s].valid = 1'b0;",
+            "                iqs[__iq].entry_1[__s].valid = 1'b0;",
+            "            end",
+            "        end",
             "        for (int __p = 0; __p < ISSUE_WIDTH; __p++) begin",
             "            int __pid_v;",
             "            __pid_v = iqs[__iq].ports[__p].port_idx;",
@@ -561,7 +585,7 @@ def _build_cpp_input_sanitizer(module_info, method_name, instance_name):
     if module_info.get("module_type") != "Isu":
         return "    // (no harness input sanitizer)"
 
-    if method_name not in ("comb_enq", "comb_issue", "comb_awake"):
+    if method_name not in ("comb_enq", "comb_issue", "comb_awake", "comb_flush"):
         return "    // (no harness input sanitizer)"
 
     cfg_dispatch_sync_line = (
@@ -669,6 +693,29 @@ def _build_cpp_input_sanitizer(module_info, method_name, instance_name):
             "            if (__pid >= ISSUE_WIDTH) __pid = ISSUE_WIDTH - 1;",
             "            __q.ports[__p].port_idx = __pid;",
             "        }",
+            "    }",
+        ])
+
+    if method_name == "comb_flush":
+        lines.extend([
+            "    // ---- Harness input sanitizer (Isu::comb_flush) ----",
+            "    // Keep metadata and vector-backed dimensions consistent to avoid undefined C++ behavior",
+            "    // during flush_br/clear_br style scans.",
+            f"    if ({instance_name}.latency_pipe.size() < DIV_MAX_LATENCY) {instance_name}.latency_pipe.resize(DIV_MAX_LATENCY);",
+            f"    if ({instance_name}.latency_pipe_1.size() < DIV_MAX_LATENCY) {instance_name}.latency_pipe_1.resize(DIV_MAX_LATENCY);",
+            f"    for (int __iq = 0; __iq < IQ_NUM && __iq < static_cast<int>({instance_name}.iqs.size()); ++__iq) {{",
+            f"        auto& __q = {instance_name}.iqs[__iq];",
+            "        if (__q.size < 0) __q.size = 0;",
+            "        if (__q.size > MAX_IQ_SIZE) __q.size = MAX_IQ_SIZE;",
+            "        if (__q.entry_1.size() < static_cast<size_t>(__q.size)) __q.entry_1.resize(__q.size);",
+            "        if (__q.count_1 < 0) __q.count_1 = 0;",
+            "        if (__q.count_1 > __q.size) __q.count_1 = __q.size;",
+            "        int __ww = (__q.size + 63) / 64;",
+            "        if (__ww < 1) __ww = 1;",
+            "        __q.wake_words_per_row = __ww;",
+            "        size_t __need = static_cast<size_t>(PRF_NUM) * static_cast<size_t>(__ww);",
+            "        if (__q.wake_matrix_src1.size() < __need) __q.wake_matrix_src1.resize(__need, 0);",
+            "        if (__q.wake_matrix_src2.size() < __need) __q.wake_matrix_src2.resize(__need, 0);",
             "    }",
         ])
 
@@ -1108,6 +1155,8 @@ def _project_specific_io_hints(module_info, method_name):
         ),
         "comb_flush": (
             [
+                "iqs[i].size",
+                "iqs[i].wake_words_per_row",
                 "iqs[i].count_1",
                 "iqs[i].entry_1.valid",
                 "iqs[i].entry_1.uop.br_mask",
@@ -1118,7 +1167,6 @@ def _project_specific_io_hints(module_info, method_name):
                 "iqs[i].count_1",
                 "iqs[i].entry_1.valid",
                 "iqs[i].entry_1.uop.br_mask",
-                "latency_pipe_1.valid",
                 "latency_pipe_1.br_mask",
             ],
         ),

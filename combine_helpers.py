@@ -87,6 +87,17 @@ def build_combined_module_sv(bf, combine_info, snippets, default_strategy="zero_
             return lines
         return [ln[min_indent:] if ln.strip() else "" for ln in lines]
 
+    def _append_method_block(method_name):
+        task_key = f"{module_type}_{method_name}"
+        if task_key not in snippets:
+            return
+        parts.append(f"    // ---- {method_name} (LLM) ----")
+        body_lines = normalize_indent(snippets[task_key].splitlines())
+        parts.append(f"    begin : {method_name}")
+        parts.extend([f"        {ln}" if ln.strip() else "" for ln in body_lines])
+        parts.append("    end")
+        parts.append("")
+
     parts = [
         f"module {bf['module_name']} (",
         f"    input  wire [{bf['pi_width'] - 1}:0] pi,",
@@ -120,6 +131,13 @@ def build_combined_module_sv(bf, combine_info, snippets, default_strategy="zero_
         [*input_decls, *internal_decls, *output_decls],
         strategy=default_strategy,
     ))
+
+    # `init` in simulator wrappers is executed before per-cycle pi unpack.
+    # Keep this ordering so config/metadata tables are initialized before methods
+    # that consume them (for example Isu queue size/dispatch metadata).
+    if "init" in method_order:
+        _append_method_block("init")
+
     parts.extend([
         "    // ---- Input extraction from pi[] ----",
         bf["pi_code"],
@@ -127,21 +145,9 @@ def build_combined_module_sv(bf, combine_info, snippets, default_strategy="zero_
     ])
 
     for method_name in method_order:
-        # `init` is constructor-time logic in simulator wrappers (called once
-        # before per-cycle io_generator_outer flow), not per-cycle combinational
-        # logic. Keep it in prompt/snippet tasks, but do not inline it into the
-        # generated always_comb pipeline.
         if method_name == "init":
             continue
-        task_key = f"{module_type}_{method_name}"
-        if task_key not in snippets:
-            continue
-        parts.append(f"    // ---- {method_name} (LLM) ----")
-        body_lines = normalize_indent(snippets[task_key].splitlines())
-        parts.append(f"    begin : {method_name}")
-        parts.extend([f"        {ln}" if ln.strip() else "" for ln in body_lines])
-        parts.append("    end")
-        parts.append("")
+        _append_method_block(method_name)
 
     parts.extend([
         "    // ---- Output packing to po[] ----",

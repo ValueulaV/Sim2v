@@ -333,6 +333,23 @@ Method-specific constraints:
 - Do not emulate push-back with `for (w=0;w<N;w++) if (w==lp1_idx) ...` gated writes.
   Use direct `latency_pipe_1[lp1_idx]` read/modify/write with a typed temporary.
 """,
+    ("Isu", "comb_flush"): """\
+Method-specific constraints:
+- Preserve C++ `flush_br` / `clear_br` / latency-pipe behavior exactly.
+- On `in.rob_bcast->flush`, clear all `iqs[*].entry_1[*].valid`, reset `count_1`,
+  clear wake matrices, and clear both `latency_pipe` and `latency_pipe_1`.
+- On `in.dec_bcast->mispred`, queue-side behavior must match C++ `flush_br(br_mask)` exactly.
+- For `latency_pipe_1` in mispred path, preserve C++ `erase` semantics (order-preserving compaction):
+  remove matching entries and shift later surviving entries down; do not only clear `valid` bits in place.
+- In mispred-path erase, match condition is only `(entry.br_mask & br_mask) != 0`;
+  do NOT gate erase by `entry.valid`.
+- After flush/mispred handling, apply `clear_mask` with exact C++ scope:
+  queue side via `clear_br(clear_mask)` (valid `entry_1` slots only), and
+  latency-pipe side on every surviving `latency_pipe_1` element (do NOT gate by `valid`).
+- Keep full entry payload coherence during compaction:
+  when moving surviving `latency_pipe_1` entries, move all fields together
+  (`valid`, `countdown`, `dest_preg`, `br_mask`, `rob_idx`, `rob_flag`).
+""",
 }
 
 
