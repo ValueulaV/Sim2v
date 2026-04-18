@@ -19,6 +19,9 @@ from openai import OpenAI
 from anthropic import Anthropic
 from anthropic import RateLimitError, APIConnectionError, APITimeoutError
 
+
+DEFAULT_API_TIMEOUT_S = int(os.environ.get("SIM2V_LLM_TIMEOUT_S", "180"))
+
 def _prompt_hash(messages):
     """Stable hash for a prompt message list."""
     packed = json.dumps(messages, ensure_ascii=False, sort_keys=True)
@@ -34,12 +37,12 @@ def get_client(model_name):
         return "anthropic", Anthropic(
             api_key=os.environ.get("AWS_API_KEY"),
             base_url="https://ace2.ezclaude.com",
-            timeout=900,
+            timeout=DEFAULT_API_TIMEOUT_S,
         )
     return "openai", OpenAI(
         api_key=os.environ["ARK_API_KEY"],
         base_url="https://ark.cn-beijing.volces.com/api/v3",
-        timeout=900,
+        timeout=DEFAULT_API_TIMEOUT_S,
     )
 
 

@@ -179,6 +179,11 @@ Method-specific constraints:
 - Preserve first-fit port binding semantics exactly:
   scan active ports from low to high index and pick the first free compatible port, using
   `q.ports[p].port_idx` and `q.ports[p].capability_mask` directly.
+- `PortBinding_t` for this method has only the declared fields from SV context.
+  Do not invent extra per-port metadata such as `port_valid`, `valid`, `enabled`, `present`,
+  `port_num`, or `num_ports`.
+- When scanning ports, treat the active domain as the framework-declared fixed `ISSUE_WIDTH`
+  port array plus existing compatibility checks. Do not add an extra guessed `port_valid` gate.
 - Preserve emit-stage port semantics exactly:
   after schedule returns `<entry_idx, phys_port>`, all downstream checks/outputs must index by
   `phys_port` (`in_exe2iss.ready[phys_port]`, `in_exe2iss.fu_ready_mask[phys_port]`,
@@ -209,6 +214,9 @@ Method-specific constraints:
     `q.ports[selected_port_idx].port_idx` or `tmp_q.ports[sel_port_idx].port_idx`.
     Select the whole `PortBinding_t` into a temporary via constant-index `case`/guards first,
     then read `tmp_port.port_idx`.
+  - when using `case (...)` for constant-index selection, each item must be plain SV syntax
+    like `0: begin ... end`. Do not insert extra labels such as
+    `0: some_label: begin ... end`.
   - do not write output fields through dynamic chained access such as
     `out_iss2prf.iss_entry[phys_port].valid` or
     `out_iss2prf.iss_entry[phys_port].uop.dest_preg`.
@@ -338,7 +346,20 @@ Method-specific constraints:
 - Preserve C++ `flush_br` / `clear_br` / latency-pipe behavior exactly.
 - On `in.rob_bcast->flush`, clear all `iqs[*].entry_1[*].valid`, reset `count_1`,
   clear wake matrices, and clear both `latency_pipe` and `latency_pipe_1`.
+- Queue slot loops for this method are over the IQ storage size (`q.size`, up to 64 here),
+  not over `ISSUE_WIDTH` / issue-port count. Never use 12 as the bound for `entry_1` traversal.
+- `flush_all()` / `flush_br()` / `clear_br()` semantics all iterate queue slots by queue size.
+  If you write `for (...) entry_1[i] ...`, the bound must cover every queue slot, not only ports.
 - On `in.dec_bcast->mispred`, queue-side behavior must match C++ `flush_br(br_mask)` exactly.
+- In queue-side `flush_br(br_mask)`, for each matching valid slot:
+  clear dependency bits for that exact slot index, then clear `entry_1[i].valid`, then decrement `count_1`.
+- For dependency-bit clearing, match `clear_dep_bits_for_slot(entry_1[i], i)` exactly:
+  `slot_word = i >> 6`, `slot_bit = 1 << (i & 63)`,
+  matrix row index = `preg * wake_words_per_row + slot_word`.
+  Do NOT index wake matrices by `preg` alone.
+- `wake_words_per_row` belongs to the live queue object/state (`q` / `iqs[qi]` / `IssueQueue_t`),
+  not to `configs[qi]` / `IssueQueueConfig_t`.
+  Do not read or invent `configs[qi].wake_words_per_row`.
 - For `latency_pipe_1` in mispred path, preserve C++ `erase` semantics (order-preserving compaction):
   remove matching entries and shift later surviving entries down; do not only clear `valid` bits in place.
 - In mispred-path erase, match condition is only `(entry.br_mask & br_mask) != 0`;
@@ -346,6 +367,12 @@ Method-specific constraints:
 - After flush/mispred handling, apply `clear_mask` with exact C++ scope:
   queue side via `clear_br(clear_mask)` (valid `entry_1` slots only), and
   latency-pipe side on every surviving `latency_pipe_1` element (do NOT gate by `valid`).
+- For `latency_pipe_1`, preserve the exact C++ phase order:
+  first erase/compact mispred-matching entries using the old `br_mask`,
+  then run `entry.br_mask &= ~clear_mask` on every surviving compacted entry.
+  Do not merge these phases, and do not leave surviving `br_mask` bits unchanged after `clear_mask`.
+- In queue-side `clear_br(clear_mask)`, only valid `entry_1[i]` entries are updated,
+  but the loop still scans all queue slots `0..q.size-1`.
 - Keep full entry payload coherence during compaction:
   when moving surviving `latency_pipe_1` entries, move all fields together
   (`valid`, `countdown`, `dest_preg`, `br_mask`, `rob_idx`, `rob_flag`).

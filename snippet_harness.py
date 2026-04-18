@@ -8,7 +8,7 @@ from itertools import product
 import bsd_analyzer
 import combine_helpers
 import signal_debug
-from sv_path import escape_sv_keyword
+from sv_path import cpp_path_to_sv, escape_sv_keyword
 
 
 SNIPPET_DEBUG_PROMPT = """\
@@ -227,9 +227,25 @@ def build_method_io_targets(module_info, method_name, max_targets):
 def build_signal_plan(module_info, targets, instance_name, loop_domains=None, respect_dependencies=False):
     # signal plan 会把较粗的 target 路径展开成“可直接打包/比较”的叶子信号列表。
     # 后续的 SV wrapper、C++ reference、mismatch 定位都依赖这份 plan。
+    mapped_leaves = _mapping_leaf_map(module_info, instance_name)
     leaves = []
     for target in targets:
+        exact_leaves = _expand_target_from_mapping(target, mapped_leaves)
+        if exact_leaves:
+            leaves.extend(exact_leaves)
+            continue
         leaves.extend(_expand_target_path(module_info, target, instance_name, loop_domains=loop_domains))
+
+    # Wrapper pi/po mapping is the source of truth for snippet harness bit widths.
+    # Some simulator types are declared with generic widths (for example BR_MASK_WIDTH=64)
+    # while the generated wrapper packs only the live lower bits (for example 16).
+    # Align leaf widths to the real wrapper mapping before dedup/packing so that
+    # the SV wrapper and C++ reference share the same boundary.
+    width_overrides = _mapping_width_overrides(module_info)
+    for leaf in leaves:
+        override = width_overrides.get(leaf["label"])
+        if override is not None:
+            leaf["width"] = int(override)
 
     dedup = []
     seen = set()
@@ -258,6 +274,71 @@ def build_signal_plan(module_info, targets, instance_name, loop_domains=None, re
         "pi_width": width,
         "po_width": width,
     }
+
+
+def _mapping_width_overrides(module_info):
+    overrides = {}
+    for key in ("inputs", "outputs"):
+        for entry in module_info.get(key, []):
+            path = entry.get("path")
+            width = entry.get("width")
+            if not path or width is None:
+                continue
+            overrides[cpp_path_to_sv(path)] = int(width)
+    return overrides
+
+
+def _mapping_leaf_map(module_info, instance_name):
+    leaves = []
+    for key in ("inputs", "outputs"):
+        for entry in module_info.get(key, []):
+            path = entry.get("path")
+            width = entry.get("width")
+            if not path or width is None:
+                continue
+            label = cpp_path_to_sv(path)
+            leaves.append({
+                "label": label,
+                "width": int(width),
+                "sv_expr": _sv_leaf_expr(module_info, label),
+                "cpp_expr": _cpp_path_expr(label, instance_name),
+            })
+    return leaves
+
+
+def _expand_target_from_mapping(target, mapped_leaves):
+    matches = []
+    target = (target or "").strip()
+    if not target:
+        return matches
+    for leaf in mapped_leaves:
+        label = leaf["label"]
+        if _mapping_target_matches(target, label):
+            matches.append(dict(leaf))
+    return matches
+
+
+def _mapping_target_matches(target, label):
+    if label == target or _is_prefix(target, label):
+        return True
+    target_tokens = [_strip_all_indices(tok) for tok in _split_path_tokens(target)]
+    label_tokens = [_strip_all_indices(tok) for tok in _split_path_tokens(label)]
+    if not target_tokens or not label_tokens:
+        return False
+    ti = 0
+    li = 0
+    while ti < len(target_tokens) and li < len(label_tokens):
+        if target_tokens[ti] == label_tokens[li]:
+            ti += 1
+            li += 1
+            continue
+        # Allow coarse targets like `entry_1.uop` to skip concrete array indices
+        # inserted in mapping leaves, e.g. `entry_1[3].uop`.
+        if li + 1 < len(label_tokens) and target_tokens[ti] == label_tokens[li + 1]:
+            li += 1
+            continue
+        return False
+    return ti == len(target_tokens)
 
 
 def drop_leaves_from_plan(plan, blocked_labels):

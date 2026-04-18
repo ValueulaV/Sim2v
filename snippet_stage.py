@@ -411,6 +411,10 @@ def _snippet_static_guard(module_type, method_name, snippet_code):
         return None
 
     src = snippet_code or ""
+    # Ignore explanatory comments when scanning for forbidden code patterns.
+    # The guard should only reason about executable snippet content.
+    src = re.sub(r"/\*.*?\*/", " ", src, flags=re.S)
+    src = re.sub(r"//.*", " ", src)
     findings = []
 
     assign = r"(?:<=|(?<![=!<>])=(?!=))"
