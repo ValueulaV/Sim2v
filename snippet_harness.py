@@ -659,6 +659,29 @@ def _build_sv_input_sanitizer(module_type, method_name):
             "    end",
         ])
 
+    if method_name == "comb_flush":
+        lines.extend([
+            "    // ---- Harness input sanitizer (Isu::comb_flush) ----",
+            "    // Keep metadata and fixed-array bounds consistent with the C++ reference",
+            "    // so flush_br/clear_br see the same legal state domain on both sides.",
+            "    for (int __iq = 0; __iq < IQ_NUM; __iq++) begin",
+            "        int __size_v;",
+            "        int __cnt_v;",
+            "        int __ww_v;",
+            "        __size_v = iqs[__iq].size;",
+            "        if (__size_v < 0) __size_v = 0;",
+            "        if (__size_v > MAX_IQ_SIZE) __size_v = MAX_IQ_SIZE;",
+            "        iqs[__iq].size = __size_v;",
+            "        __cnt_v = iqs[__iq].count_1;",
+            "        if (__cnt_v < 0) __cnt_v = 0;",
+            "        if (__cnt_v > __size_v) __cnt_v = __size_v;",
+            "        iqs[__iq].count_1 = __cnt_v;",
+            "        __ww_v = (__size_v + 63) / 64;",
+            "        if (__ww_v < 1) __ww_v = 1;",
+            "        iqs[__iq].wake_words_per_row = __ww_v;",
+            "    end",
+        ])
+
     return "\n".join(lines) if lines else "    // (no harness input sanitizer)"
 
 
@@ -938,6 +961,20 @@ def _debug_extra_hint(verify_message):
             "first keep old valid entries with signed `countdown > 0` and decrement countdown, "
             "then append new issued entries with `lat = get_latency(decode_uop_type(inst.uop.op))` and `lat > 1`. "
             "Copy `br_mask` bitwise unchanged; do not classify latency with guessed opcode numeric literals."
+        )
+    if "latency_pipe_1" in msg and "rob_flag" in msg and "MISMATCH" in msg:
+        return (
+            "For Isu::comb_flush, latency-pipe compaction must move whole `LatencyEntry` records together. "
+            "When preserving survivors after mispred, copy `valid`, `countdown`, `dest_preg`, `br_mask`, `rob_idx`, "
+            "and `rob_flag` from the source entry into the compacted destination slot. "
+            "Do not only update `valid`/`br_mask`, and do not drop invalid-but-surviving slots."
+        )
+    if "latency_pipe_1" in msg and "br_mask" in msg and "MISMATCH" in msg:
+        return (
+            "For Isu::comb_flush mispred compaction, match the exact C++ erase rule: "
+            "remove entries when `(entry.br_mask & br_mask) != 0`, regardless of `valid`; "
+            "keep every entry whose `br_mask` does not match. "
+            "Then apply `entry.br_mask &= ~clear_mask` to every surviving compacted `latency_pipe_1` element."
         )
     if "WIDTHTRUNC" in msg or "WIDTHEXPAND" in msg or "SELRANGE" in msg:
         return (
@@ -1242,13 +1279,22 @@ def _project_specific_io_hints(module_info, method_name):
                 "iqs[i].entry_1.valid",
                 "iqs[i].entry_1.uop.br_mask",
                 "latency_pipe_1.valid",
+                "latency_pipe_1.countdown",
+                "latency_pipe_1.dest_preg",
                 "latency_pipe_1.br_mask",
+                "latency_pipe_1.rob_idx",
+                "latency_pipe_1.rob_flag",
             ],
             [
                 "iqs[i].count_1",
                 "iqs[i].entry_1.valid",
                 "iqs[i].entry_1.uop.br_mask",
+                "latency_pipe_1.valid",
+                "latency_pipe_1.countdown",
+                "latency_pipe_1.dest_preg",
                 "latency_pipe_1.br_mask",
+                "latency_pipe_1.rob_idx",
+                "latency_pipe_1.rob_flag",
             ],
         ),
     }

@@ -362,8 +362,10 @@ Method-specific constraints:
   Do not read or invent `configs[qi].wake_words_per_row`.
 - For `latency_pipe_1` in mispred path, preserve C++ `erase` semantics (order-preserving compaction):
   remove matching entries and shift later surviving entries down; do not only clear `valid` bits in place.
-- In mispred-path erase, match condition is only `(entry.br_mask & br_mask) != 0`;
-  do NOT gate erase by `entry.valid`.
+- In mispred-path compaction, preserve the exact C++ erase predicate:
+  remove entries when `((entry.br_mask & br_mask) != 0)`, regardless of `valid`.
+  Keep every entry whose `br_mask` does not match, even if `valid == 0`.
+  Do not add an extra `valid` gate to the erase/keep decision.
 - After flush/mispred handling, apply `clear_mask` with exact C++ scope:
   queue side via `clear_br(clear_mask)` (valid `entry_1` slots only), and
   latency-pipe side on every surviving `latency_pipe_1` element (do NOT gate by `valid`).
