@@ -266,17 +266,6 @@ def _run_yosys_syntax_check(paths):
         return True, ""
 
     stderr_raw = (ret.stderr or "").strip()
-    if re.search(r"syntax error,\s*unexpected\s+'?\.|syntax error,\s*unexpected\s+\.", stderr_raw):
-        # Yosys front-end has known limitations on some packed array-of-struct
-        # member accesses used by this project; keep the check enabled but do
-        # not block downstream verilator-based compile/equivalence on this
-        # specific parser limitation.
-        _write_text(
-            os.path.join(paths["artifact_dir"], "yosys_nonblocking_note.txt"),
-            "Ignored known yosys parser limitation: unexpected '.'\n",
-        )
-        return True, ""
-
     stdout = _clip_text((ret.stdout or "").strip(), COMPILE_MSG_MAX_CHARS)
     stderr = _clip_text(stderr_raw, COMPILE_MSG_MAX_CHARS)
     msg = [
