@@ -5,7 +5,7 @@ yosys: /opt/homebrew/Cellar/yosys/0.64/bin/yosys
 
 llm:
   model: claude-sonnet-4-6
-  max_workers: 3
+  max_workers: 12
   sample_num: 1
   max_tasks: 0
   infer_use_think: false
@@ -34,7 +34,7 @@ verify:
 
 snippet:
   enabled: true
-  max_workers: 6
-  parallel_jobs: 4
+  max_workers: 16
+  parallel_jobs: 12
   max_iterations: 8
   max_compare_targets: 8
