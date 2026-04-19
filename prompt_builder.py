@@ -848,7 +848,7 @@ def get_combine_info(bsd_dir, base_dir=".", mapping_provider=None):
     used_constants = _all_sv_constants(all_constants)
 
     pi_lines = mapping_provider.generate_pi_sv(
-        module_info["inputs"], max_width=module_info["pi_width"]
+        module_info["inputs"], max_width=module_info["pi_width"], module_info=module_info
     )
     pi_code = "\n".join(pi_lines)
 
@@ -857,7 +857,7 @@ def get_combine_info(bsd_dir, base_dir=".", mapping_provider=None):
         module_name = os.path.splitext(bf["filename"])[0]
         out_signals = [{"path": sig, "width": w} for sig, w in bf["unpack_lines"]]
         po_lines = mapping_provider.generate_po_sv(
-            out_signals, max_width=bf["po_width"]
+            out_signals, max_width=bf["po_width"], module_info=module_info
         )
 
         bsd_entries.append({

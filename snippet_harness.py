@@ -8,7 +8,7 @@ from itertools import product
 import bsd_analyzer
 import combine_helpers
 import signal_debug
-from sv_path import cpp_path_to_sv, escape_sv_keyword
+from sv_path import cpp_path_to_sv, escape_sv_keyword, path_to_sv_slice
 
 
 SNIPPET_DEBUG_PROMPT = """\
@@ -262,7 +262,7 @@ def build_signal_plan(module_info, targets, instance_name, loop_domains=None, re
     signal_map = []
     offset = 0
     for leaf in dedup:
-        leaf["sv_expr"] = _sv_leaf_expr(module_info, leaf["label"])
+        leaf["sv_expr"] = _sv_leaf_expr(module_info, leaf["label"], width_hint=leaf.get("width"))
         signal_map.append({"path": leaf["label"], "width": leaf["width"], "offset": offset})
         leaf["offset"] = offset
         offset += leaf["width"]
@@ -300,7 +300,7 @@ def _mapping_leaf_map(module_info, instance_name):
             leaves.append({
                 "label": label,
                 "width": int(width),
-                "sv_expr": _sv_leaf_expr(module_info, label),
+                "sv_expr": _sv_leaf_expr(module_info, label, width_hint=int(width)),
                 "cpp_expr": _cpp_path_expr(label, instance_name),
             })
     return leaves
@@ -581,6 +581,7 @@ def _build_sv_input_sanitizer(module_type, method_name):
             "        int __free_v;",
             "        int __keep_v;",
             "        int __dw_v;",
+            "        DisIssReq_t __req_tmp;",
             "        __cnt_v = 0;",
             "        __size_v = iqs[__iq].size;",
             "        if (__size_v < 0) __size_v = 0;",
@@ -601,16 +602,19 @@ def _build_sv_input_sanitizer(module_type, method_name):
             "        __free_v = __size_v - __cnt_v;",
             "        __keep_v = 0;",
             "        for (int __w = 0; __w < ISSUE_WIDTH; __w++) begin",
+            "            __req_tmp = in_dis2iss.req[__iq][__w];",
             "            if (__w < __dw_v) begin",
-            "                if (in_dis2iss.req[__iq][__w].valid) begin",
+            "                if (__req_tmp.valid) begin",
                     "                    if (__keep_v < __free_v) begin",
                     "                        __keep_v = __keep_v + 1;",
             "                    end else begin",
-            "                        in_dis2iss.req[__iq][__w].valid = 1'b0;",
+            "                        __req_tmp.valid = 1'b0;",
+            "                        in_dis2iss.req[__iq][__w] = __req_tmp;",
             "                    end",
             "                end",
             "            end else begin",
-            "                in_dis2iss.req[__iq][__w].valid = 1'b0;",
+            "                __req_tmp.valid = 1'b0;",
+            "                in_dis2iss.req[__iq][__w] = __req_tmp;",
             "            end",
             "        end",
             "    end",
@@ -1504,9 +1508,12 @@ def _build_roots(module_info, instance_name):
     return roots
 
 
-def _sv_leaf_expr(module_info, label):
-    # 叶子路径优先保留结构化访问形式。
-    # 这比把 packed struct 降成整块 bit-slice 更稳定，也更利于 Yosys/Verilator 报错定位。
+def _sv_leaf_expr(module_info, label, width_hint=None):
+    # Prefer packed bit-slice expressions for compatibility with yosys when
+    # path crosses packed-struct aggregate arrays (arr[idx].field syntax).
+    packed = path_to_sv_slice(module_info, label, width_hint=width_hint)
+    if packed:
+        return packed
     return _sv_path_expr(label)
 
 
@@ -2085,10 +2092,11 @@ def _build_sv_input_unpack(input_plan):
     # input_plan 已经给出每个叶子信号在 pi 中的 offset/width，这里只负责直译成赋值语句。
     lines = []
     for leaf in input_plan["leaves"]:
+        safe_lhs = leaf.get("sv_expr") or ""
         if leaf["width"] == 1:
-            lines.append(f"    {leaf['sv_expr']} = pi[{leaf['offset']}];")
+            lines.append(f"    {safe_lhs} = pi[{leaf['offset']}];")
         else:
-            lines.append(f"    {leaf['sv_expr']} = pi[{leaf['offset']} +: {leaf['width']}];")
+            lines.append(f"    {safe_lhs} = pi[{leaf['offset']} +: {leaf['width']}];")
     return "\n".join(lines) if lines else "    // (no free inputs)"
 
 
