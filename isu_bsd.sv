@@ -3904,86 +3904,123 @@ always_comb begin
         integer __ci_i, __ci_j, __ci_p, __ci_idx, __ci_port;
         integer __ci_sel_port;
         integer __ci_issued;
+        integer __ci_cleared;
         logic [4:0] __ci_op;
         logic [63:0] __ci_req_bit;
         integer __ci_committed_buf [0:63];
         integer __ci_committed_count;
         integer __ci_entry_idx;
-        IssueQueue_t __ci_q;
         IqStoredUop_t __ci_uop;
         IqStoredEntry_t __ci_entry;
         logic [11:0] __ci_port_busy;
-        
+        integer __ci_word;
+        logic [63:0] __ci_slot_bit;
+        logic [63:0] __ci_clear_bits;
+        logic [7:0] __ci_preg8;
+
         // Clear iss2prf entries
         for (__ci_i = 0; __ci_i < 12; __ci_i++) begin
             out_iss2prf.iss_entry[__ci_i].valid = 1'b0;
         end
-        
+
         for (__ci_i = 0; __ci_i < 5; __ci_i++) begin
-            __ci_q = iqs[__ci_i];
             __ci_committed_count = 0;
             __ci_issued = 0;
             __ci_port_busy = '0;
-        
+
             // Schedule: iterate slot index 1..size-1 (skip slot 0)
             for (__ci_idx = 1; __ci_idx < 64; __ci_idx++) begin
-                if (__ci_idx < __ci_q.size && __ci_issued < 4) begin
-                    __ci_entry = __ci_q.entry[__ci_idx];
+                if (__ci_idx < iqs[__ci_i].size && __ci_issued < 4) begin
+                    __ci_entry = iqs[__ci_i].entry[__ci_idx];
                     if (__ci_entry.valid) begin
                         // Check if ready: (!src1_en || !src1_busy) && (!src2_en || !src2_busy)
                         if (!((__ci_entry.uop.src1_en && __ci_entry.uop.src1_busy) ||
                               (__ci_entry.uop.src2_en && __ci_entry.uop.src2_busy))) begin
-        
+
                             __ci_op = __ci_entry.uop.op;
                             __ci_req_bit = 64'b1 << __ci_op;
-        
+
                             // Find matching port (first-fit, no break)
                             __ci_sel_port = -1;
                             for (__ci_p = 0; __ci_p < 4; __ci_p++) begin
                                 if (__ci_sel_port == -1 && !__ci_port_busy[__ci_p] &&
-                                    ((__ci_q.ports[__ci_p].capability_mask & __ci_req_bit) != 64'b0)) begin
+                                    ((iqs[__ci_i].ports[__ci_p].capability_mask & __ci_req_bit) != 64'b0)) begin
                                     __ci_sel_port = __ci_p;
                                 end
                             end
-        
+
                             if (__ci_sel_port != -1) begin
                                 __ci_port_busy[__ci_sel_port] = 1'b1;
                                 __ci_issued = __ci_issued + 1;
-        
-                                __ci_port = __ci_q.ports[__ci_sel_port].port_idx;
-        
+
+                                // Get port_idx via case (avoid dynamic array indexing)
+                                case (__ci_i)
+                                    0: case (__ci_sel_port)
+                                        0: __ci_port = iqs[0].ports[0].port_idx;
+                                        1: __ci_port = iqs[0].ports[1].port_idx;
+                                        2: __ci_port = iqs[0].ports[2].port_idx;
+                                        3: __ci_port = iqs[0].ports[3].port_idx;
+                                        default: __ci_port = 32'd0;
+                                    endcase
+                                    1: case (__ci_sel_port)
+                                        0: __ci_port = iqs[1].ports[0].port_idx;
+                                        1: __ci_port = iqs[1].ports[1].port_idx;
+                                        default: __ci_port = 32'd0;
+                                    endcase
+                                    2: case (__ci_sel_port)
+                                        0: __ci_port = iqs[2].ports[0].port_idx;
+                                        1: __ci_port = iqs[2].ports[1].port_idx;
+                                        default: __ci_port = 32'd0;
+                                    endcase
+                                    3: case (__ci_sel_port)
+                                        0: __ci_port = iqs[3].ports[0].port_idx;
+                                        1: __ci_port = iqs[3].ports[1].port_idx;
+                                        default: __ci_port = 32'd0;
+                                    endcase
+                                    4: case (__ci_sel_port)
+                                        0: __ci_port = iqs[4].ports[0].port_idx;
+                                        1: __ci_port = iqs[4].ports[1].port_idx;
+                                        default: __ci_port = 32'd0;
+                                    endcase
+                                    default: __ci_port = 32'd0;
+                                endcase
+
                                 // Check backpressure from EXU
                                 if (in_exe2iss.ready[__ci_port] &&
                                     ((in_exe2iss.fu_ready_mask[__ci_port] & __ci_req_bit) != 64'b0) &&
                                     !in_rob_bcast.flush && !in_dec_bcast.mispred) begin
-        
-                                    out_iss2prf.iss_entry[__ci_port].valid = 1'b1;
-                                    // Convert IqStoredUop to IssPrfUop (field-by-field)
-                                    out_iss2prf.iss_entry[__ci_port].uop.dest_preg   = __ci_entry.uop.dest_preg;
-                                    out_iss2prf.iss_entry[__ci_port].uop.src1_preg   = __ci_entry.uop.src1_preg;
-                                    out_iss2prf.iss_entry[__ci_port].uop.src2_preg   = __ci_entry.uop.src2_preg;
-                                    out_iss2prf.iss_entry[__ci_port].uop.ftq_idx     = __ci_entry.uop.ftq_idx;
-                                    out_iss2prf.iss_entry[__ci_port].uop.ftq_offset  = __ci_entry.uop.ftq_offset;
-                                    out_iss2prf.iss_entry[__ci_port].uop.is_atomic   = __ci_entry.uop.is_atomic;
-                                    out_iss2prf.iss_entry[__ci_port].uop.dest_en     = __ci_entry.uop.dest_en;
-                                    out_iss2prf.iss_entry[__ci_port].uop.src1_en     = __ci_entry.uop.src1_en;
-                                    out_iss2prf.iss_entry[__ci_port].uop.src2_en     = __ci_entry.uop.src2_en;
-                                    out_iss2prf.iss_entry[__ci_port].uop.src1_is_pc  = __ci_entry.uop.src1_is_pc;
-                                    out_iss2prf.iss_entry[__ci_port].uop.src2_is_imm = __ci_entry.uop.src2_is_imm;
-                                    out_iss2prf.iss_entry[__ci_port].uop.func3       = __ci_entry.uop.func3;
-                                    out_iss2prf.iss_entry[__ci_port].uop.func7       = __ci_entry.uop.func7;
-                                    out_iss2prf.iss_entry[__ci_port].uop.imm         = __ci_entry.uop.imm;
-                                    out_iss2prf.iss_entry[__ci_port].uop.br_id       = __ci_entry.uop.br_id;
-                                    out_iss2prf.iss_entry[__ci_port].uop.br_mask     = __ci_entry.uop.br_mask;
-                                    out_iss2prf.iss_entry[__ci_port].uop.csr_idx     = __ci_entry.uop.csr_idx;
-                                    out_iss2prf.iss_entry[__ci_port].uop.rob_idx     = __ci_entry.uop.rob_idx;
-                                    out_iss2prf.iss_entry[__ci_port].uop.stq_idx     = __ci_entry.uop.stq_idx;
-                                    out_iss2prf.iss_entry[__ci_port].uop.stq_flag    = __ci_entry.uop.stq_flag;
-                                    out_iss2prf.iss_entry[__ci_port].uop.ldq_idx     = __ci_entry.uop.ldq_idx;
-                                    out_iss2prf.iss_entry[__ci_port].uop.rob_flag    = __ci_entry.uop.rob_flag;
-                                    out_iss2prf.iss_entry[__ci_port].uop.op          = __ci_entry.uop.op;
-                                    out_iss2prf.iss_entry[__ci_port].uop.dbg         = __ci_entry.uop.dbg;
-        
+
+                                    // Write to iss_entry with constant-indexed loop for yosys compat
+                                    for (int __ci_po = 0; __ci_po < 12; __ci_po++) begin
+                                        if (__ci_po == __ci_port) begin
+                                            out_iss2prf.iss_entry[__ci_po].valid = 1'b1;
+                                            out_iss2prf.iss_entry[__ci_po].uop.dest_preg   = __ci_entry.uop.dest_preg;
+                                            out_iss2prf.iss_entry[__ci_po].uop.src1_preg   = __ci_entry.uop.src1_preg;
+                                            out_iss2prf.iss_entry[__ci_po].uop.src2_preg   = __ci_entry.uop.src2_preg;
+                                            out_iss2prf.iss_entry[__ci_po].uop.ftq_idx     = __ci_entry.uop.ftq_idx;
+                                            out_iss2prf.iss_entry[__ci_po].uop.ftq_offset  = __ci_entry.uop.ftq_offset;
+                                            out_iss2prf.iss_entry[__ci_po].uop.is_atomic   = __ci_entry.uop.is_atomic;
+                                            out_iss2prf.iss_entry[__ci_po].uop.dest_en     = __ci_entry.uop.dest_en;
+                                            out_iss2prf.iss_entry[__ci_po].uop.src1_en     = __ci_entry.uop.src1_en;
+                                            out_iss2prf.iss_entry[__ci_po].uop.src2_en     = __ci_entry.uop.src2_en;
+                                            out_iss2prf.iss_entry[__ci_po].uop.src1_is_pc  = __ci_entry.uop.src1_is_pc;
+                                            out_iss2prf.iss_entry[__ci_po].uop.src2_is_imm = __ci_entry.uop.src2_is_imm;
+                                            out_iss2prf.iss_entry[__ci_po].uop.func3       = __ci_entry.uop.func3;
+                                            out_iss2prf.iss_entry[__ci_po].uop.func7       = __ci_entry.uop.func7;
+                                            out_iss2prf.iss_entry[__ci_po].uop.imm         = __ci_entry.uop.imm;
+                                            out_iss2prf.iss_entry[__ci_po].uop.br_id       = __ci_entry.uop.br_id;
+                                            out_iss2prf.iss_entry[__ci_po].uop.br_mask     = __ci_entry.uop.br_mask;
+                                            out_iss2prf.iss_entry[__ci_po].uop.csr_idx     = __ci_entry.uop.csr_idx;
+                                            out_iss2prf.iss_entry[__ci_po].uop.rob_idx     = __ci_entry.uop.rob_idx;
+                                            out_iss2prf.iss_entry[__ci_po].uop.stq_idx     = __ci_entry.uop.stq_idx;
+                                            out_iss2prf.iss_entry[__ci_po].uop.stq_flag    = __ci_entry.uop.stq_flag;
+                                            out_iss2prf.iss_entry[__ci_po].uop.ldq_idx     = __ci_entry.uop.ldq_idx;
+                                            out_iss2prf.iss_entry[__ci_po].uop.rob_flag    = __ci_entry.uop.rob_flag;
+                                            out_iss2prf.iss_entry[__ci_po].uop.op          = __ci_entry.uop.op;
+                                            out_iss2prf.iss_entry[__ci_po].uop.dbg         = __ci_entry.uop.dbg;
+                                        end
+                                    end
+
                                     __ci_committed_buf[__ci_committed_count] = __ci_idx;
                                     __ci_committed_count = __ci_committed_count + 1;
                                 end
@@ -3992,24 +4029,56 @@ always_comb begin
                     end
                 end
             end
-        
+
             // Commit issued entries
-            committed_indices_buf[__ci_i] = '0;
+            for (int __ci_ci = 0; __ci_ci < 12; __ci_ci++) begin
+                committed_indices_buf[__ci_i][__ci_ci] = 32'd0;
+            end
             for (__ci_j = 0; __ci_j < 4; __ci_j++) begin
                 if (__ci_j < __ci_committed_count) begin
                     committed_indices_buf[__ci_i][__ci_j] = __ci_committed_buf[__ci_j];
                 end
             end
-        
-            // Remove committed entries from entry_1
-            for (__ci_j = 0; __ci_j < 4; __ci_j++) begin
-                if (__ci_j < __ci_committed_count) begin
-                    __ci_idx = __ci_committed_buf[__ci_j];
-                    __ci_q.entry_1[__ci_idx].valid = 1'b0;
-                    __ci_q.count_1 = __ci_q.count_1 - 1;
+
+            // Remove committed entries from entry_1 (constant-indexed for yosys compat)
+            // Match C++ commit_issue: only clear if entry_1[idx].valid
+            __ci_cleared = 0;
+            for (int __clr_i = 0; __clr_i < 64; __clr_i++) begin
+                for (__ci_j = 0; __ci_j < 4; __ci_j++) begin
+                    if (__ci_j < __ci_committed_count && __clr_i == __ci_committed_buf[__ci_j] &&
+                        iqs[__ci_i].entry_1[__clr_i].valid) begin
+                        // clear_dep_bits_for_slot
+                        __ci_word = __clr_i >> 6;
+                        __ci_slot_bit = 64'b1 << (__clr_i & 6'h3f);
+                        __ci_clear_bits = ~__ci_slot_bit;
+                        if (iqs[__ci_i].entry_1[__clr_i].uop.src1_en) begin
+                            __ci_preg8 = iqs[__ci_i].entry_1[__clr_i].uop.src1_preg;
+                            if (__ci_preg8 < 160) begin
+                                for (int __ci_mi = 0; __ci_mi < 160; __ci_mi++) begin
+                                    if (__ci_mi == __ci_preg8 * iqs[__ci_i].wake_words_per_row + __ci_word) begin
+                                        iqs[__ci_i].wake_matrix_src1[__ci_mi] =
+                                            iqs[__ci_i].wake_matrix_src1[__ci_mi] & __ci_clear_bits;
+                                    end
+                                end
+                            end
+                        end
+                        if (iqs[__ci_i].entry_1[__clr_i].uop.src2_en) begin
+                            __ci_preg8 = iqs[__ci_i].entry_1[__clr_i].uop.src2_preg;
+                            if (__ci_preg8 < 160) begin
+                                for (int __ci_mi = 0; __ci_mi < 160; __ci_mi++) begin
+                                    if (__ci_mi == __ci_preg8 * iqs[__ci_i].wake_words_per_row + __ci_word) begin
+                                        iqs[__ci_i].wake_matrix_src2[__ci_mi] =
+                                            iqs[__ci_i].wake_matrix_src2[__ci_mi] & __ci_clear_bits;
+                                    end
+                                end
+                            end
+                        end
+                        iqs[__ci_i].entry_1[__clr_i].valid = 1'b0;
+                        __ci_cleared = __ci_cleared + 1;
+                    end
                 end
             end
-            iqs[__ci_i] = __ci_q;
+            iqs[__ci_i].count_1 = iqs[__ci_i].count_1 - __ci_cleared;
         end
     end
 
@@ -4018,8 +4087,6 @@ always_comb begin
         integer __ca_k, __ca_i;
         logic [7:0] __ca_preg;
         integer __ca_preg_count;
-        logic [159:0][63:0] __ca_wm_src1;
-        logic [159:0][63:0] __ca_wm_src2;
         integer __ca_w, __ca_word;
         logic [63:0] __ca_mask;
         integer __ca_bit;
@@ -4027,11 +4094,10 @@ always_comb begin
         integer __ca_bt;
         IqStoredEntry_t __ca_entry;
         logic [7:0] __ca_pregs [0:7];
-        IssueQueue_t __ca_q;
         logic [4:0] __ca_op;
-        
+
         __ca_preg_count = 0;
-        
+
         // Source A: Slow wakeup from PRF (load writeback)
         for (__ca_i = 0; __ca_i < 2; __ca_i++) begin
             if (in_prf_awake.wake[__ca_i].valid) begin
@@ -4039,37 +4105,35 @@ always_comb begin
                 __ca_preg_count = __ca_preg_count + 1;
             end
         end
-        
-        // Source B: Delayed wakeup (from latency_pipe, countdown == 0)
+
+        // Source B: Delayed wakeup (from latency_pipe, countdown == 0) - disabled.
+        // C++ ref init() clears latency_pipe, range-for never iterates.
         for (__ca_i = 0; __ca_i < 18; __ca_i++) begin
-            if (latency_pipe[__ca_i].valid && (latency_pipe[__ca_i].countdown == 32'h0)) begin
-                __ca_pregs[__ca_preg_count] = latency_pipe[__ca_i].dest_preg[7:0];
-                __ca_preg_count = __ca_preg_count + 1;
-            end
         end
-        
+
         // Source C: Fast wakeup (single-cycle ALU issued this cycle)
+        // Note: C++ ref also requires lat <= 1 (excludes MUL/DIV) in addition to
+        // op != LOAD && op != STA. Match C++ behavior.
         for (__ca_i = 0; __ca_i < 12; __ca_i++) begin
             if (out_iss2prf.iss_entry[__ca_i].valid && out_iss2prf.iss_entry[__ca_i].uop.dest_en) begin
                 __ca_op = out_iss2prf.iss_entry[__ca_i].uop.op;
-                // get_latency <= 1 and not LOAD/STA
-                if ((__ca_op != 5'd3) && (__ca_op != 5'd4)) begin
+                // lat <= 1 && not LOAD(3) && not STA(4)
+                if ((__ca_op != 5'd3) && (__ca_op != 5'd4) && (__ca_op != 5'd13) && (__ca_op != 5'd14)) begin
                     __ca_pregs[__ca_preg_count] = out_iss2prf.iss_entry[__ca_i].uop.dest_preg;
                     __ca_preg_count = __ca_preg_count + 1;
                 end
             end
         end
-        
-        // Wakeup all IQs
+
+        // Wakeup all IQs (work with iqs directly for yosys compat)
         for (__ca_i = 0; __ca_i < 5; __ca_i++) begin
-            __ca_q = iqs[__ca_i];
             for (__ca_k = 0; __ca_k < 32; __ca_k++) begin
                 if (__ca_k < __ca_preg_count && __ca_pregs[__ca_k] < 160) begin
                     __ca_preg = __ca_pregs[__ca_k];
                 for (__ca_w = 0; __ca_w < 1; __ca_w++) begin
-                    __ca_word = __ca_preg * __ca_q.wake_words_per_row + __ca_w;
+                    __ca_word = __ca_preg * iqs[__ca_i].wake_words_per_row + __ca_w;
                     // src1 wakeup
-                    __ca_mask = __ca_q.wake_matrix_src1[__ca_word];
+                    __ca_mask = iqs[__ca_i].wake_matrix_src1[__ca_word];
                     while (__ca_mask != 64'b0) begin
                         // inline ctz
                         __ca_bit = 0;
@@ -4080,19 +4144,27 @@ always_comb begin
                             end
                         end
                         __ca_idx = (__ca_w << 6) + __ca_bit;
-                        if (__ca_idx < __ca_q.size) begin
-                            __ca_entry = __ca_q.entry_1[__ca_idx];
+                        if (__ca_idx < iqs[__ca_i].size) begin
+                            __ca_entry = iqs[__ca_i].entry_1[__ca_idx];
                             if (__ca_entry.valid && __ca_entry.uop.src1_en &&
                                 __ca_entry.uop.src1_busy && (__ca_entry.uop.src1_preg == __ca_preg)) begin
                                 __ca_entry.uop.src1_busy = 1'b0;
-                                __ca_q.entry_1[__ca_idx] = __ca_entry;
+                                for (int __ca_ei = 0; __ca_ei < 64; __ca_ei++) begin
+                                    if (__ca_ei == __ca_idx) begin
+                                        iqs[__ca_i].entry_1[__ca_ei] = __ca_entry;
+                                    end
+                                end
                             end
                         end
                         __ca_mask = __ca_mask & (__ca_mask - 64'b1);
                     end
-                    __ca_q.wake_matrix_src1[__ca_word] = '0;
+                    for (int __ca_wi = 0; __ca_wi < 160; __ca_wi++) begin
+                        if (__ca_wi == __ca_word) begin
+                            iqs[__ca_i].wake_matrix_src1[__ca_wi] = '0;
+                        end
+                    end
                     // src2 wakeup
-                    __ca_mask = __ca_q.wake_matrix_src2[__ca_word];
+                    __ca_mask = iqs[__ca_i].wake_matrix_src2[__ca_word];
                     while (__ca_mask != 64'b0) begin
                         // inline ctz
                         __ca_bit = 0;
@@ -4103,23 +4175,30 @@ always_comb begin
                             end
                         end
                         __ca_idx = (__ca_w << 6) + __ca_bit;
-                        if (__ca_idx < __ca_q.size) begin
-                            __ca_entry = __ca_q.entry_1[__ca_idx];
+                        if (__ca_idx < iqs[__ca_i].size) begin
+                            __ca_entry = iqs[__ca_i].entry_1[__ca_idx];
                             if (__ca_entry.valid && __ca_entry.uop.src2_en &&
                                 __ca_entry.uop.src2_busy && (__ca_entry.uop.src2_preg == __ca_preg)) begin
                                 __ca_entry.uop.src2_busy = 1'b0;
-                                __ca_q.entry_1[__ca_idx] = __ca_entry;
+                                for (int __ca_ei = 0; __ca_ei < 64; __ca_ei++) begin
+                                    if (__ca_ei == __ca_idx) begin
+                                        iqs[__ca_i].entry_1[__ca_ei] = __ca_entry;
+                                    end
+                                end
                             end
                         end
                         __ca_mask = __ca_mask & (__ca_mask - 64'b1);
                     end
-                    __ca_q.wake_matrix_src2[__ca_word] = '0;
+                    for (int __ca_wi = 0; __ca_wi < 160; __ca_wi++) begin
+                        if (__ca_wi == __ca_word) begin
+                            iqs[__ca_i].wake_matrix_src2[__ca_wi] = '0;
+                        end
+                    end
                 end
                 end
             end
-            iqs[__ca_i] = __ca_q;
         end
-        
+
         // Write out_iss_awake
         for (__ca_i = 0; __ca_i < 8; __ca_i++) begin
             if (__ca_i < __ca_preg_count) begin
@@ -4152,21 +4231,10 @@ always_comb begin
             latency_pipe_1[__cl_i].rob_flag  = 32'h0;
         end
         
-        // Part 1: Countdown existing entries from latency_pipe
+        // Part 1: Countdown existing entries from latency_pipe (disabled - C++ ref
+        // init() clears latency_pipe, making range-based for skip all entries)
         for (__cl_i = 0; __cl_i < 18; __cl_i++) begin
             __cl_entry = latency_pipe[__cl_i];
-            if (__cl_entry.valid && ($signed(__cl_entry.countdown) > 32'sh0)) begin
-                __cl_new.valid     = __cl_entry.valid;
-                __cl_new.countdown = __cl_entry.countdown - 32'h1;
-                __cl_new.dest_preg = __cl_entry.dest_preg;
-                __cl_new.br_mask   = __cl_entry.br_mask;
-                __cl_new.rob_idx   = __cl_entry.rob_idx;
-                __cl_new.rob_flag  = __cl_entry.rob_flag;
-                if (__cl_lp1_idx < 18) begin
-                    latency_pipe_1[__cl_lp1_idx] = __cl_new;
-                    __cl_lp1_idx = __cl_lp1_idx + 1;
-                end
-            end
         end
         
         // Part 2: New issued instructions with multi-cycle latency
@@ -4203,16 +4271,26 @@ always_comb begin
         logic [7:0] __ce_wake_preg;
         IqStoredUop_t __ce_uop;
         IqStoredEntry_t __ce_entry;
-        IqStoredEntry_t __ce_slot_tmp;
-        IssueQueue_t __ce_q;
         DisIssReq_t __ce_req;
         logic [7:0] __ce_preg8;
-        
+        logic [63:0] __ce_free_mask;
+        integer __ce_enq_cnt;
+        integer __ce_word;
+
         for (__ce_i = 0; __ce_i < 5; __ce_i++) begin
             __ce_max_w = configs[__ce_i].dispatch_width;
             __ce_q_size = iqs[__ce_i].size;
-            __ce_q = iqs[__ce_i];
-        
+
+            // Build free mask: bit s=1 means slot s is free (not valid)
+            __ce_free_mask = 64'b0;
+            for (__ce_s = 0; __ce_s < 64; __ce_s++) begin
+                if (__ce_s < __ce_q_size && !iqs[__ce_i].entry_1[__ce_s].valid) begin
+                    __ce_free_mask[__ce_s] = 1'b1;
+                end
+            end
+
+            __ce_enq_cnt = 0;
+
             for (__ce_w = 0; __ce_w < 8; __ce_w++) begin
                 if (__ce_w < __ce_max_w) begin
                     __ce_req = in_dis2iss.req[__ce_i][__ce_w];
@@ -4244,7 +4322,7 @@ always_comb begin
                         __ce_uop.rob_flag    = __ce_req.uop.rob_flag;
                         __ce_uop.op          = __ce_req.uop.op;
                         __ce_uop.dbg         = __ce_req.uop.dbg;
-        
+
                         // apply_wakeup_to_uop: check iss_awake
                         for (__ce_k = 0; __ce_k < 8; __ce_k++) begin
                             if (out_iss_awake.wake[__ce_k].valid) begin
@@ -4257,35 +4335,48 @@ always_comb begin
                                 end
                             end
                         end
-        
-                        // Try to enqueue
-                        if (__ce_q.count_1 < __ce_q_size) begin
+
+                        // Try to enqueue if room
+                        if (iqs[__ce_i].count_1 + __ce_enq_cnt < __ce_q_size) begin
                             __ce_done = 0;
                             for (__ce_s = 0; __ce_s < 64; __ce_s++) begin
                                 if (!__ce_done && (__ce_s < __ce_q_size)) begin
-                                    __ce_slot_tmp = __ce_q.entry_1[__ce_s];
-                                    if (!__ce_slot_tmp.valid) begin
+                                    if (__ce_free_mask[__ce_s]) begin
+                                        __ce_free_mask[__ce_s] = 1'b0;
+                                        __ce_enq_cnt = __ce_enq_cnt + 1;
+
                                         __ce_entry.valid = 1'b1;
                                         __ce_entry.uop = __ce_uop;
-                                        __ce_q.entry_1[__ce_s] = __ce_entry;
-                                        __ce_q.count_1 = __ce_q.count_1 + 1;
-        
-                                        // Set dependency bits in wake matrix
+                                        // Write with constant-indexed loop for yosys
+                                        for (int __ce_ei = 0; __ce_ei < 64; __ce_ei++) begin
+                                            if (__ce_ei == __ce_s) begin
+                                                iqs[__ce_i].entry_1[__ce_ei] = __ce_entry;
+                                            end
+                                        end
+
                                         __ce_slot = __ce_s;
                                         if (__ce_uop.src1_en && __ce_uop.src1_busy) begin
                                             __ce_preg8 = __ce_uop.src1_preg;
                                             if (__ce_preg8 < 160) begin
-                                                __ce_q.wake_matrix_src1[__ce_preg8 * __ce_q.wake_words_per_row + (__ce_slot >> 6)] =
-                                                    __ce_q.wake_matrix_src1[__ce_preg8 * __ce_q.wake_words_per_row + (__ce_slot >> 6)] |
-                                                    (64'b1 << (__ce_slot & 6'h3f));
+                                                for (int __ce_wi = 0; __ce_wi < 160; __ce_wi++) begin
+                                                    if (__ce_wi == __ce_preg8 * iqs[__ce_i].wake_words_per_row + (__ce_slot >> 6)) begin
+                                                        iqs[__ce_i].wake_matrix_src1[__ce_wi] =
+                                                            iqs[__ce_i].wake_matrix_src1[__ce_wi] |
+                                                            (64'b1 << (__ce_slot & 6'h3f));
+                                                    end
+                                                end
                                             end
                                         end
                                         if (__ce_uop.src2_en && __ce_uop.src2_busy) begin
                                             __ce_preg8 = __ce_uop.src2_preg;
                                             if (__ce_preg8 < 160) begin
-                                                __ce_q.wake_matrix_src2[__ce_preg8 * __ce_q.wake_words_per_row + (__ce_slot >> 6)] =
-                                                    __ce_q.wake_matrix_src2[__ce_preg8 * __ce_q.wake_words_per_row + (__ce_slot >> 6)] |
-                                                    (64'b1 << (__ce_slot & 6'h3f));
+                                                for (int __ce_wi = 0; __ce_wi < 160; __ce_wi++) begin
+                                                    if (__ce_wi == __ce_preg8 * iqs[__ce_i].wake_words_per_row + (__ce_slot >> 6)) begin
+                                                        iqs[__ce_i].wake_matrix_src2[__ce_wi] =
+                                                            iqs[__ce_i].wake_matrix_src2[__ce_wi] |
+                                                            (64'b1 << (__ce_slot & 6'h3f));
+                                                    end
+                                                end
                                             end
                                         end
                                         __ce_done = 1;
@@ -4296,7 +4387,7 @@ always_comb begin
                     end
                 end
             end
-            iqs[__ce_i] = __ce_q;
+            iqs[__ce_i].count_1 = iqs[__ce_i].count_1 + __ce_enq_cnt;
         end
     end
 
@@ -4311,27 +4402,24 @@ always_comb begin
         integer __cf_surv;
         LatencyEntry_t __cf_lpe;
         LatencyEntry_t __cf_lpe_arr [0:17];
-        IssueQueue_t __cf_q;
         IqStoredEntry_t __cf_e;
         logic __cf_match;
-        
+
         __cf_clear = in_dec_bcast.clear_mask;
-        
+
         if (in_rob_bcast.flush) begin
-            // Flush all IQs
+            // Flush all IQs (direct iqs access for yosys compat)
             for (__cf_qi = 0; __cf_qi < 5; __cf_qi++) begin
-                __cf_q = iqs[__cf_qi];
                 for (__cf_i = 0; __cf_i < 64; __cf_i++) begin
-                    if (__cf_i < __cf_q.size) begin
-                        __cf_q.entry_1[__cf_i].valid = 1'b0;
+                    if (__cf_i < iqs[__cf_qi].size) begin
+                        iqs[__cf_qi].entry_1[__cf_i].valid = 1'b0;
                     end
                 end
-                __cf_q.count_1 = 32'h0;
+                iqs[__cf_qi].count_1 = 32'h0;
                 for (__cf_i = 0; __cf_i < 160; __cf_i++) begin
-                    __cf_q.wake_matrix_src1[__cf_i] = 64'h0;
-                    __cf_q.wake_matrix_src2[__cf_i] = 64'h0;
+                    iqs[__cf_qi].wake_matrix_src1[__cf_i] = 64'h0;
+                    iqs[__cf_qi].wake_matrix_src2[__cf_i] = 64'h0;
                 end
-                iqs[__cf_qi] = __cf_q;
             end
             // Flush latency_pipe
             for (__cf_i = 0; __cf_i < 18; __cf_i++) begin
@@ -4354,10 +4442,9 @@ always_comb begin
         end else if (in_dec_bcast.mispred) begin
             // Flush branch-matching entries from IQs
             for (__cf_qi = 0; __cf_qi < 5; __cf_qi++) begin
-                __cf_q = iqs[__cf_qi];
                 for (__cf_i = 0; __cf_i < 64; __cf_i++) begin
-                    if (__cf_i < __cf_q.size) begin
-                        __cf_e = __cf_q.entry_1[__cf_i];
+                    if (__cf_i < iqs[__cf_qi].size) begin
+                        __cf_e = iqs[__cf_qi].entry_1[__cf_i];
                         if (__cf_e.valid) begin
                             __cf_match = ((__cf_e.uop.br_mask & in_dec_bcast.br_mask) != 64'b0);
                             if (__cf_match) begin
@@ -4368,26 +4455,41 @@ always_comb begin
                                 if (__cf_e.uop.src1_en) begin
                                     __cf_preg8 = __cf_e.uop.src1_preg;
                                     if (__cf_preg8 < 160) begin
-                                        __cf_q.wake_matrix_src1[__cf_preg8 * __cf_q.wake_words_per_row + __cf_word] =
-                                            __cf_q.wake_matrix_src1[__cf_preg8 * __cf_q.wake_words_per_row + __cf_word] & __cf_clear_bits;
+                                        for (int __cf_mi = 0; __cf_mi < 160; __cf_mi++) begin
+                                            if (__cf_mi == __cf_preg8 * iqs[__cf_qi].wake_words_per_row + __cf_word) begin
+                                                iqs[__cf_qi].wake_matrix_src1[__cf_mi] =
+                                                    iqs[__cf_qi].wake_matrix_src1[__cf_mi] & __cf_clear_bits;
+                                            end
+                                        end
                                     end
                                 end
                                 if (__cf_e.uop.src2_en) begin
                                     __cf_preg8 = __cf_e.uop.src2_preg;
                                     if (__cf_preg8 < 160) begin
-                                        __cf_q.wake_matrix_src2[__cf_preg8 * __cf_q.wake_words_per_row + __cf_word] =
-                                            __cf_q.wake_matrix_src2[__cf_preg8 * __cf_q.wake_words_per_row + __cf_word] & __cf_clear_bits;
+                                        for (int __cf_mi = 0; __cf_mi < 160; __cf_mi++) begin
+                                            if (__cf_mi == __cf_preg8 * iqs[__cf_qi].wake_words_per_row + __cf_word) begin
+                                                iqs[__cf_qi].wake_matrix_src2[__cf_mi] =
+                                                    iqs[__cf_qi].wake_matrix_src2[__cf_mi] & __cf_clear_bits;
+                                            end
+                                        end
                                     end
                                 end
-                                __cf_q.entry_1[__cf_i].valid = 1'b0;
-                                __cf_q.count_1 = __cf_q.count_1 - 1;
+                                iqs[__cf_qi].entry_1[__cf_i].valid = 1'b0;
                             end
                         end
                     end
                 end
-                iqs[__cf_qi] = __cf_q;
             end
-        
+            // Recompute count from actual valid entries after branch flush
+            for (__cf_qi = 0; __cf_qi < 5; __cf_qi++) begin
+                iqs[__cf_qi].count_1 = 32'd0;
+                for (int __cf_ci = 0; __cf_ci < 64; __cf_ci++) begin
+                    if (__cf_ci < iqs[__cf_qi].size && iqs[__cf_qi].entry_1[__cf_ci].valid) begin
+                        iqs[__cf_qi].count_1 = iqs[__cf_qi].count_1 + 32'd1;
+                    end
+                end
+            end
+
             // Flush matching entries from latency_pipe_1
             __cf_surv = 0;
             for (__cf_i = 0; __cf_i < 18; __cf_i++) begin
@@ -4410,19 +4512,17 @@ always_comb begin
                 latency_pipe_1[__cf_i] = __cf_lpe_arr[__cf_i];
             end
         end
-        
+
         // Clear resolved branch bits from surviving entries
         if (__cf_clear != 64'b0) begin
             for (__cf_qi = 0; __cf_qi < 5; __cf_qi++) begin
-                __cf_q = iqs[__cf_qi];
                 for (__cf_i = 0; __cf_i < 64; __cf_i++) begin
-                    if (__cf_i < __cf_q.size) begin
-                        if (__cf_q.entry_1[__cf_i].valid) begin
-                            __cf_q.entry_1[__cf_i].uop.br_mask = __cf_q.entry_1[__cf_i].uop.br_mask & ~__cf_clear;
+                    if (__cf_i < iqs[__cf_qi].size) begin
+                        if (iqs[__cf_qi].entry_1[__cf_i].valid) begin
+                            iqs[__cf_qi].entry_1[__cf_i].uop.br_mask = iqs[__cf_qi].entry_1[__cf_i].uop.br_mask & ~__cf_clear;
                         end
                     end
                 end
-                iqs[__cf_qi] = __cf_q;
             end
             for (__cf_i = 0; __cf_i < 18; __cf_i++) begin
                 __cf_lpe = latency_pipe_1[__cf_i];
