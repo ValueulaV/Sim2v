@@ -287,8 +287,8 @@ def cmd_verify(cfg, logger, run_dir, target=None):
                 logger.warning(f"No cpp reference for {name}")
                 continue
 
-            verify_cpp_path = _prepare_verify_cpp_path(cpp_path, name, run_dir, logger)
-            info = parse_cpp_header(verify_cpp_path)
+            # verify_cpp_path = _prepare_verify_cpp_path(cpp_path, name, run_dir, logger)
+            info = parse_cpp_header(cpp_path)
             # output_signal_map 决定了 testbench 在 mismatch 时如何把 bit 位置反查成语义化信号名。
             # 没有它也能验证，但报错会退化成“第 N bit 错”，调试体验会差很多。
             output_signal_map = _build_output_signal_map(cpp_path, name, mapping_provider)
@@ -297,7 +297,7 @@ def cmd_verify(cfg, logger, run_dir, target=None):
 
             logger.info(f"Verifying {name} ({source})...")
             passed, msg = verifier.verify(
-                verify_cpp_path, verilog_code, name,
+                cpp_path, verilog_code, name,
                 info["pi_width"], info["po_width"],
                 vcfg["exhaustive_threshold"],
                 vcfg["max_test_vectors"],
