@@ -181,7 +181,7 @@ def _materialize_verification_artifacts(*, cpp_path, verilog_code, module_name, 
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
     build_dir = os.path.join(artifact_dir, "build")
-    cflags = f"-std=c++17 -O2 {extra_cflags}".strip()
+    cflags = f"-std=c++17 -O2 -DNDEBUG {extra_cflags}".strip()
     verilate_cmd = [
         verilator_bin,
         "-Wno-SYMRSVDWORD",

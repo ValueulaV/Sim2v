@@ -463,6 +463,8 @@ def build_cpp_reference(*, wrapper_text, module_info, module_type, instance_name
         "#define Assert(cond) ((void)0)",
         *include_lines,
         *other_prefix_lines,
+    ]
+    lines += [
         f"#ifndef {header_guard}",
         f"#define {header_guard}",
         f"extern const int PI_WIDTH = {input_plan['pi_width']};",
@@ -2051,6 +2053,21 @@ def _cpp_path_expr(path, instance_name):
                 cur += f"[{_cpp_index_expr(idx, set(), instance_name)}]"
             first_rest = False
         return cur
+    # Handle SV-flattened interface paths like "out_csr_status.privilege"
+    # which should map to C++ "instance.out.csr_status->privilege"
+    if len(tokens) >= 1 and tokens[0].startswith(("in_", "out_")):
+        prefix = "in" if tokens[0].startswith("in_") else "out"
+        field_after_prefix = tokens[0][len(prefix) + 1:]  # strip "in_" or "out_"
+        if field_after_prefix:
+            cur = f"{instance_name}.{prefix}.{field_after_prefix}"
+            first_rest = True
+            for token in tokens[1:]:
+                name, indices = _split_indexed_token(token)
+                cur += ("->" if first_rest else ".") + name
+                for idx in indices:
+                    cur += f"[{_cpp_index_expr(idx, set(), instance_name)}]"
+                first_rest = False
+            return cur
     root_name, root_indices = _split_indexed_token(tokens[0])
     cur = f"{instance_name}.{root_name}"
     for idx in root_indices:

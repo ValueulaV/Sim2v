@@ -341,6 +341,16 @@ def _load_known_constants():
             continue
         with open(path) as f:
             contents.append(_strip_comments(f.read()))
+    # Also scan all other headers in simulator_include for enum constants
+    # (e.g. Csr.h defines enum_csr with csr_misa=20, etc.)
+    if os.path.isdir(SIMULATOR_INCLUDE):
+        for fname in sorted(os.listdir(SIMULATOR_INCLUDE)):
+            if not fname.endswith(".h") or fname in header_names:
+                continue
+            path = os.path.join(SIMULATOR_INCLUDE, fname)
+            if os.path.isfile(path):
+                with open(path) as f:
+                    contents.append(_strip_comments(f.read()))
     if not contents:
         return {}
 
@@ -552,7 +562,10 @@ def _prepare_record_body_for_fields(body, record_name=None):
             # Method declarations (`foo();`) may appear before data members in
             # some module headers (e.g. ROB). Skip declarations but stop at
             # inline method bodies to avoid parsing function code as fields.
-            if line.endswith(";") and "{" not in line:
+            # Strip trailing comments before checking for semicolon, since
+            # `void comb_begin(); // comment` should be treated as a declaration.
+            stripped_for_check = re.sub(r'\s*//.*$', '', line)
+            if stripped_for_check.rstrip().endswith(";") and "{" not in line:
                 continue
             break
         lines.append(line)
@@ -865,12 +878,14 @@ def _collect_structs_by_depth(structs, roots, max_depth):
     return selected
 
 
-def get_struct_order_for_method(structs, module_type, method_body=None, expand_depth=1):
+def get_struct_order_for_method(structs, module_type, method_body=None, expand_depth=1, extra_roots=None):
     # 给 prompt 做类型裁剪时，不必总是把整个 simulator_include 全塞进去。
     # 这里按 root type + method 实际引用，截取一个足够小的 struct 子图。
     if expand_depth == 0:
         return []
     roots = _struct_roots_for_method(structs, module_type, method_body)
+    if extra_roots:
+        roots.update(extra_roots)
     selected = _collect_structs_by_depth(structs, roots, expand_depth)
     return _topo_sort_structs(structs, selected)
 
@@ -906,7 +921,7 @@ def generate_cpp_type_sources(struct_sources, ordered_structs):
     return "\n".join(parts).strip()
 
 
-def generate_sv_typedefs(structs, type_widths, module_type=None, method_body=None, expand_depth=-1, ordered_structs=None):
+def generate_sv_typedefs(structs, type_widths, module_type=None, method_body=None, expand_depth=-1, ordered_structs=None, extra_roots=None):
     # 这是 C++ 类型数据库到 SV typedef 的单向投影。
     # 当前策略偏保守：只生成后续 prompt/combine/snippet 真正会用到的 packed struct 定义。
     if ordered_structs is None:
@@ -916,6 +931,7 @@ def generate_sv_typedefs(structs, type_widths, module_type=None, method_body=Non
                 module_type,
                 method_body=method_body,
                 expand_depth=expand_depth,
+                extra_roots=extra_roots,
             )
             if not ordered:
                 ordered = _topo_sort_structs(structs, set(structs.keys()))

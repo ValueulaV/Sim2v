@@ -15,6 +15,7 @@ from bsd_analyzer import (
     extract_method_helpers,
     parse_all_constants, get_struct_order_for_method, generate_cpp_type_sources,
     get_method_signal_width_hints, KNOWN_CONSTANTS, _try_eval_const_expr,
+    _method_referenced_structs,
     project_context_for_logic,
 )
 
@@ -381,6 +382,48 @@ Method-specific constraints:
   when moving surviving `latency_pipe_1` entries, move all fields together
   (`valid`, `countdown`, `dest_preg`, `br_mask`, `rob_idx`, `rob_flag`).
 """,
+    ("Csr", "comb_csr_read"): """\
+	Method-specific constraints:
+	- Do NOT call `cvt_number_to_csr()` as a function. It is a C++ switch-case that maps
+	  CSR address numbers (e.g. 0x300) to enum array indices (e.g. csr_mstatus = 7).
+	  Inline its logic as a case/lookup using the provided `number_*` and `csr_*` constants.
+	- `CSR_RegFile[idx]` is a reg array indexed by enum_csr values, not RISC-V CSR addresses.
+	""",
+    ("Csr", "comb_csr_write"): """\
+	Method-specific constraints:
+	- Do NOT call `cvt_number_to_csr()` as a function. It is a C++ switch-case that maps
+	  CSR address numbers (e.g. 0x300) to enum array indices (e.g. csr_mstatus = 7).
+	  Inline its logic as a case/lookup using the provided `number_*` and `csr_*` constants.
+	- `CSR_RegFile[idx]` is a reg array indexed by enum_csr values, not RISC-V CSR addresses.
+	""",
+    ("Csr", "comb_exception"): """\
+	Method-specific constraints:
+	- `CSR_RegFile[idx]` is a reg array indexed by enum_csr values (e.g. csr_mstatus = 7).
+	  Use the `csr_*` constants directly as array indices. Do NOT call `cvt_number_to_csr()`.
+	- `IrqState_t` is a packed struct with 6 boolean fields for interrupt states.
+	  All fields: m_software_interrupt, m_timer_interrupt, m_external_interrupt,
+	              s_software_interrupt, s_timer_interrupt, s_external_interrupt.
+	- `eval_interrupts()` is provided as a helper function. Translate its logic faithfully.
+	  The interrupt conditions use bitwise AND with mask constants (e.g. `mip_reg & MIP_MSIP`),
+	  privilege level checks, and mstatus MIE/SIE bit gating. Preserve ALL conditions exactly.
+	- `privilege` is a 2-bit signal [1:0]. `privilege < 3` is always true for 2 bits.
+	  Replace `privilege < 3` with `1'b1` (always true). Replace `privilege == 3` with
+	  `privilege == 2'b11` to avoid CMPCONST warnings.
+	""",
+    ("Csr", "comb_interrupt"): """\
+	Method-specific constraints:
+	- `CSR_RegFile[idx]` is a reg array indexed by enum_csr values.
+	  Use the `csr_*` constants directly as array indices.
+	- `IrqState_t` is a packed struct with 6 boolean fields for interrupt states.
+	  All fields: m_software_interrupt, m_timer_interrupt, m_external_interrupt,
+	              s_software_interrupt, s_timer_interrupt, s_external_interrupt.
+	- `eval_interrupts()` is provided as a helper function. Translate its logic faithfully.
+	  The interrupt conditions use bitwise AND with mask constants (e.g. `mip_reg & MIP_MSIP`),
+	  privilege level checks, and mstatus MIE/SIE bit gating. Preserve ALL conditions exactly.
+	- `privilege` is a 2-bit signal [1:0]. `privilege < 3` is always true for 2 bits.
+	  Replace `privilege < 3` with `1'b1` (always true). Replace `privilege == 3` with
+	  `privilege == 2'b11` to avoid CMPCONST warnings.
+	""",
 }
 
 
@@ -837,8 +880,13 @@ def get_combine_info(bsd_dir, base_dir=".", mapping_provider=None):
     # combine_info 是各阶段共享的“模块装配上下文”：
     # prompt 用它准备环境，snippet 用它生成单方法 wrapper，
     # combine 用它装配完整模块。
+    # Scan all method bodies for struct references not reachable from the
+    # module type itself (e.g. IrqState used as local variables in methods).
+    all_method_text = "\n".join(m.get("body", "") for m in module_info.get("methods", []))
+    extra_struct_roots = _method_referenced_structs(module_info["structs"], all_method_text)
     sv_typedefs = generate_sv_typedefs(
-        module_info["structs"], module_info["type_widths"], module_type=module_type, expand_depth=-1
+        module_info["structs"], module_info["type_widths"], module_type=module_type,
+        expand_depth=-1, extra_roots=extra_struct_roots,
     )
     var_decls = generate_sv_var_declarations(module_info["structs"], module_type)
     all_constants = parse_all_constants()

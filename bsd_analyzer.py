@@ -7,6 +7,7 @@ import re
 import io_mapping
 from bsd_types import (
     KNOWN_CONSTANTS,
+    _method_referenced_structs,
     _try_eval_const_expr,
     _validate_signal_paths,
     extract_method_helpers,
@@ -258,6 +259,77 @@ def parse_header_inline_helpers(header_name):
     return helpers
 
 
+def _parse_anonymous_namespace_helpers(cpp_source):
+    """Extract free inline functions and structs from anonymous namespaces in _cpp.h."""
+    helpers = {}
+    # Find anonymous namespace blocks
+    for m in re.finditer(r'namespace\s*\{', cpp_source):
+        start = m.end()
+        close = _find_matching_brace_scope(cpp_source, start)
+        if close < 0:
+            continue
+        block = cpp_source[start:close]
+        # Extract inline functions
+        func_pat = re.compile(r'(inline\s+\w+\s+(\w+)\s*\([^)]*\)\s*\{)')
+        for fm in func_pat.finditer(block):
+            name = fm.group(2)
+            body = _extract_braced_body(block, fm.end())
+            helpers[name] = fm.group(1) + "\n" + body.rstrip() + "\n}"
+    return helpers
+
+
+def _find_matching_brace_scope(text, start):
+    """Find the closing } for a scope opened at start (depth starts at 1)."""
+    depth = 1
+    i = start
+    in_line_comment = False
+    in_block_comment = False
+    in_string = None
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_string:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == in_string:
+                in_string = None
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch in ('"', "'"):
+            in_string = ch
+            i += 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
 def build_helper_db(module_info):
     helpers = parse_helper_functions()
     helpers.update(parse_module_member_helpers(
@@ -266,6 +338,22 @@ def build_helper_db(module_info):
     ))
     if module_info.get("module_type") == "Isu":
         helpers.update(parse_header_inline_helpers("IssueQueue.h"))
+    # Scan anonymous namespace helpers from _cpp.h (e.g. eval_interrupts for Csr)
+    cpp_source = module_info.get("logic_source", "")
+    if cpp_source:
+        helpers.update(_parse_anonymous_namespace_helpers(cpp_source))
+    # Also scan the module header for free inline functions like cvt_number_to_csr()
+    module_header = f"{module_info['module_type']}.h"
+    module_header_path = os.path.join(SIMULATOR_INCLUDE, module_header)
+    if os.path.exists(module_header_path):
+        with open(module_header_path) as f:
+            content = f.read()
+        func_pat = re.compile(r'(inline\s+\w+\s+(\w+)\s*\([^)]*\)\s*\{)')
+        for m in func_pat.finditer(content):
+            name = m.group(2)
+            if name not in helpers:
+                body = _extract_braced_body(content, m.end())
+                helpers[name] = m.group(1) + "\n" + body.rstrip() + "\n}"
     return helpers
 
 
