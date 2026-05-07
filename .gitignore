@@ -9,7 +9,7 @@ output/
 *.tmp
 
 # io_generator
-# io_generator/
+io_generator/
 
 # Mac DS_Store
 .DS_Store

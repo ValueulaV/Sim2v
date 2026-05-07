@@ -475,6 +475,13 @@ def _iter_record_defs(text):
             pos = m.end()
             continue
 
+        # Skip template structs/classes — their fields may reference
+        # template parameters (e.g. WideBits<Bits> uses kByteCount).
+        pre = text[:m.start()].rstrip()
+        if re.search(r"template\s*<[^>]*>\s*$", pre):
+            pos = m.end()
+            continue
+
         if text[m.start():m.end()].lstrip().startswith("typedef struct"):
             alias_match = re.match(r"\s*(\w+)\s*;", text[close_idx + 1:])
             if not alias_match:

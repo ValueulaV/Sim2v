@@ -56,7 +56,7 @@ def ask_llm(provider, client, model_name, messages):
         resp = client.messages.create(model=model_name, messages=messages, max_tokens=128000)
         return resp.content[0].text
 
-    resp = client.chat.completions.create(model=model_name, messages=messages, max_tokens=65536)
+    resp = client.chat.completions.create(model=model_name, messages=messages, max_tokens=32768)
     return resp.choices[0].message.content
 
 

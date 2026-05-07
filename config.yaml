@@ -4,7 +4,7 @@ verilator: ~/uv-venv/sim2v/lib/python3.12/site-packages/verilator/bin/verilator
 yosys: /opt/homebrew/Cellar/yosys/0.64/bin/yosys
 
 llm:
-  model: claude-sonnet-4-6
+  model: ep-20260327162910-vh9pj
   max_workers: 12
   sample_num: 1
   max_tasks: 0
@@ -14,7 +14,8 @@ llm:
 input_dirs:
   # - io_generator/prf_bsd
   # - io_generator/rob_bsd
-  - io_generator/isu_bsd
+  # - io_generator/isu_bsd
+  - io_generator/csr_bsd
 
 output_dir: output
 
