@@ -184,11 +184,6 @@ def _materialize_verification_artifacts(*, cpp_path, verilog_code, module_name, 
     cflags = f"-std=c++17 -O2 -DNDEBUG {extra_cflags}".strip()
     verilate_cmd = [
         verilator_bin,
-        "-Wno-SYMRSVDWORD",
-        "-Wno-WIDTHCONCAT",
-        "-Wno-WIDTHTRUNC",
-        "-Wno-WIDTHEXPAND",
-        "-Wno-SELRANGE",
         "--cc", rtl_path,
         "--exe", tb_path,
         "--top-module", module_name,
@@ -404,11 +399,6 @@ def _run_compile_only(paths):
 
     cmd = [
         paths["verilator_bin"],
-        "-Wno-SYMRSVDWORD",
-        "-Wno-WIDTHCONCAT",
-        "-Wno-WIDTHTRUNC",
-        "-Wno-WIDTHEXPAND",
-        "-Wno-SELRANGE",
         "--lint-only",
         "--top-module", paths["module_name"],
         paths["rtl_path"],
