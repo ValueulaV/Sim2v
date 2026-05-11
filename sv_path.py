@@ -22,6 +22,8 @@ VERILOG_KEYWORDS = frozenset({
     "shortint", "shortreal", "static", "string", "struct",
     "super", "this", "typedef", "union", "unique", "var",
     "virtual", "void",
+    # C++ reserved words that Verilator warns about (SYMRSVDWORD)
+    "interrupt",
 })
 
 

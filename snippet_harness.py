@@ -156,7 +156,7 @@ Extra hint:
 
 
 def build_method_io_targets(module_info, method_name, max_targets):
-    # 这一步决定 snippet 要“看什么输入、比什么输出”。
+    # 这一步决定 snippet 要"看什么输入、比什么输出"。
     # 策略上采用：
     # - 读集合 -> 自由输入
     # - 写集合 -> 比较目标
@@ -187,6 +187,7 @@ def build_method_io_targets(module_info, method_name, max_targets):
     reads = _drop_unhelpful_root_reads(module_info, method_name, reads)
     reads = _drop_self_feedback_reads(module_info, method_name, reads, writes)
     reads = _supplement_scalar_root_reads(module_info, method_body + "\n" + "\n".join(helpers.values()), reads)
+    reads = _drop_non_signal_targets(reads)
     output_targets = _filter_targets(module_info, writes, max_targets=max_targets, allow_inputs=False)
     input_targets = _filter_targets(module_info, reads, max_targets=max_targets * 4, allow_inputs=True)
     # For Isu::comb_issue, always keep queue-side side effects in compare targets.
@@ -225,7 +226,7 @@ def build_method_io_targets(module_info, method_name, max_targets):
 
 
 def build_signal_plan(module_info, targets, instance_name, loop_domains=None, respect_dependencies=False):
-    # signal plan 会把较粗的 target 路径展开成“可直接打包/比较”的叶子信号列表。
+    # signal plan 会把较粗的 target 路径展开成"可直接打包/比较"的叶子信号列表。
     # 后续的 SV wrapper、C++ reference、mismatch 定位都依赖这份 plan。
     mapped_leaves = _mapping_leaf_map(module_info, instance_name)
     leaves = []
@@ -369,6 +370,24 @@ def drop_leaves_from_plan(plan, blocked_labels):
     }
 
 
+def _extract_sv_functions(snippet_code):
+    """Extract function...endfunction blocks from snippet code.
+
+    Returns (functions_text, remaining_code) where functions_text contains
+    the extracted function declarations (to be placed at module level)
+    and remaining_code has the functions removed.
+    """
+    func_re = re.compile(
+        r"^[ \t]*function\s+automatic\s+.*?endfunction\b",
+        re.MULTILINE | re.DOTALL,
+    )
+    funcs = []
+    for m in func_re.finditer(snippet_code):
+        funcs.append(m.group(0).strip())
+    remaining = func_re.sub("", snippet_code).rstrip()
+    return funcs, remaining
+
+
 def build_sv_wrapper(module_name, combine_info, method_name, snippet_code, input_plan, compare_plan):
     # 单方法 SV wrapper 的职责非常明确：
     # 1) 复用完整模块的 typedef / 变量声明
@@ -377,6 +396,8 @@ def build_sv_wrapper(module_name, combine_info, method_name, snippet_code, input
     # 4) 把 compare_plan 打包回 po[]
     # 它不是完整模块，只是为了让 method body 在 snippet 阶段可编译、可对拍。
     input_decls, output_decls, internal_decls = combine_info["var_decls"]
+    # Extract function declarations to module level (yosys can't handle functions inside always blocks)
+    sv_funcs, snippet_code = _extract_sv_functions(snippet_code)
     parts = [
         f"module {module_name} (",
         f"    input  wire [{input_plan['pi_width'] - 1}:0] pi,",
@@ -387,8 +408,16 @@ def build_sv_wrapper(module_name, combine_info, method_name, snippet_code, input
         "",
     ]
     for cname, cval in combine_info.get("sv_constants", []):
-        parts.append(f"localparam int {cname} = {cval};")
+        ival = int(cval) if isinstance(cval, (int, str)) else None
+        if ival is not None and ival.bit_length() > 32:
+            parts.append(f"localparam logic [63:0] {cname} = 64'd{cval};")
+        else:
+            parts.append(f"localparam int {cname} = {cval};")
     if combine_info.get("sv_constants"):
+        parts.append("")
+    if sv_funcs:
+        for fn in sv_funcs:
+            parts.append(fn)
         parts.append("")
     parts.extend([
         *input_decls,
@@ -430,7 +459,7 @@ def build_sv_wrapper(module_name, combine_info, method_name, snippet_code, input
 
 
 def build_cpp_reference(*, wrapper_text, module_info, module_type, instance_name, method_name, input_plan, compare_plan):
-    # 这里生成的不是原始 simulator 头文件，而是“只执行当前 method”的参考壳。
+    # 这里生成的不是原始 simulator 头文件，而是"只执行当前 method"的参考壳。
     # 它和 SV wrapper 共用同一份 input_plan / compare_plan，
     # 从而保证两边观察到的输入输出边界完全一致。
     header_guard = f"SNIPPET_REF_{module_type}_{method_name}".upper()
@@ -485,6 +514,7 @@ def build_cpp_reference(*, wrapper_text, module_info, module_type, instance_name
         "    int cursor = 0;",
         _build_cpp_input_unpack(input_plan),
         _build_cpp_input_sanitizer(module_info, method_name, instance_name),
+        _build_cpp_comb_begin_call(module_info, instance_name, method_name),
         f"    {instance_name}.{method_name}();",
         _build_cpp_vector_resize_preamble(module_info, instance_name, input_plan, compare_plan, phase="before_output"),
         "    for (int i = 0; i < PO_WIDTH; ++i) po[i] = false;",
@@ -500,7 +530,7 @@ def build_cpp_reference(*, wrapper_text, module_info, module_type, instance_name
 
 
 def _build_cpp_vector_resize_preamble(module_info, instance_name, input_plan, compare_plan, phase):
-    # Python 侧把若干 std::vector 建模成了“定长数组”。
+    # Python 侧把若干 std::vector 建模成了"定长数组"。
     # C++ reference 在按下标读写这些路径前，需要显式 resize 到对应上界，
     # 否则像 `latency_pipe[i]` 这类访问会越界。
     if module_info.get("module_type") != "Isu":
@@ -546,7 +576,7 @@ def _build_cpp_vector_resize_preamble(module_info, instance_name, input_plan, co
 def _build_sv_input_sanitizer(module_type, method_name):
     # comb_awake 的参考实现对输入状态有隐式上界假设：
     # 本周期总唤醒条目数不能超过 MAX_WAKEUP_PORTS。
-    # comb_enq 对“本拍可入队条数 <= 空槽数”也有隐式前置约束（否则 Assert）。
+    # comb_enq 对"本拍可入队条数 <= 空槽数"也有隐式前置约束（否则 Assert）。
     # 这里在 SV/C++ 两侧同步裁剪同一组输入，保证对拍域一致且可稳定运行。
     if module_type != "Isu":
         return "    // (no harness input sanitizer)"
@@ -691,6 +721,12 @@ def _build_sv_input_sanitizer(module_type, method_name):
     return "\n".join(lines) if lines else "    // (no harness input sanitizer)"
 
 
+def _build_cpp_comb_begin_call(module_info, instance_name, method_name):
+    if method_name in ("init", "comb_begin", "seq"):
+        return "    // (no comb_begin before this method)"
+    return f"    {instance_name}.comb_begin();"
+
+
 def _build_cpp_input_sanitizer(module_info, method_name, instance_name):
     if module_info.get("module_type") != "Isu":
         return "    // (no harness input sanitizer)"
@@ -833,7 +869,7 @@ def _build_cpp_input_sanitizer(module_info, method_name, instance_name):
 
 
 def build_debug_prompt(*, module_info, method, method_ctx, input_plan, compare_plan, current_snippet, verify_message):
-    # debug prompt 不追求上下文越多越好，而是强调“最小但闭环”：
+    # debug prompt 不追求上下文越多越好，而是强调"最小但闭环"：
     # - 当前 method 的源代码和 helper
     # - 当前 snippet
     # - 当前失败信息
@@ -842,6 +878,9 @@ def build_debug_prompt(*, module_info, method, method_ctx, input_plan, compare_p
     constants_block = "\n".join(f"{k} = {v}" for k, v in sorted(method_ctx["constants"].items())) or "(none)"
     helpers_block = "\n\n".join(method_ctx["helpers"].values()) or "(none)"
     extra_hint = _debug_extra_hint(verify_message)
+    method_extra_hint = _method_debug_extra_hint(module_info["module_type"], method["name"], verify_message)
+    if method_extra_hint:
+        extra_hint = (extra_hint + "\n" + method_extra_hint) if extra_hint else method_extra_hint
     return SNIPPET_DEBUG_PROMPT.format(
         module_type=module_info["module_type"],
         method_name=method["name"],
@@ -1001,6 +1040,20 @@ def _debug_extra_hint(verify_message):
     return "(none)"
 
 
+def _method_debug_extra_hint(module_type, method_name, verify_message):
+    if module_type == "Idu" and method_name in ("comb_decode", "comb_fire"):
+        return (
+            "CRITICAL: CONFIG_BPU is NOT defined in this project. "
+            "The C++ source contains `#ifndef CONFIG_BPU / #else / #endif` or `#ifdef CONFIG_BPU` guards. "
+            "You MUST translate ONLY the non-BPU path. "
+            "For comb_decode: br_id is always 0, br_mask is always 0 for all decoded instructions. "
+            "Do NOT implement branch tag allocation, running_mask, or br_num tracking. "
+            "For comb_fire: skip all `#ifdef CONFIG_BPU` blocks entirely — no alloc_tag, no br_num, "
+            "no checkpoint save. The clear-checkpoint loop starts from i=1, NOT i=0."
+        )
+    return ""
+
+
 def parse_instance_name(wrapper_text, module_type):
     match = re.search(rf"\b{re.escape(module_type)}\s+([A-Za-z_]\w*)\s*=\s*\{{\s*\}}\s*;", wrapper_text)
     return match.group(1) if match else module_type.lower()
@@ -1098,7 +1151,7 @@ _NON_SIGNAL_METHOD_NAMES = {
 
 
 def _drop_non_signal_targets(paths):
-    # 文本 fallback 会把一部分容器/方法调用当成“路径”，例如
+    # 文本 fallback 会把一部分容器/方法调用当成"路径"，例如
     # `committed_indices_buf[i].clear` / `iqs[i].schedule`。
     # 这些并非可打包的硬件信号，放进 input/compare target 会让 harness 无意义膨胀。
     kept = []
@@ -1111,12 +1164,15 @@ def _drop_non_signal_targets(paths):
         leaf_name, leaf_indices = _split_indexed_token(parts[-1])
         if leaf_name in _NON_SIGNAL_METHOD_NAMES and not leaf_indices:
             continue
+        root_name, _ = _split_indexed_token(parts[0])
+        if root_name == "ctx":
+            continue
         kept.append(path)
     return sorted(set(kept))
 
 
 def _drop_unhelpful_root_reads(module_info, method_name, reads):
-    # read-set 中有些“整块容器根路径”会被展开成大量无意义输入位，
+    # read-set 中有些"整块容器根路径"会被展开成大量无意义输入位，
     # 既拖慢 snippet 编译，也会放大 LLM 生成空间。
     # 目前先对 Isu::comb_issue 做精确裁剪，避免把 committed_indices_buf 整块喂给 harness。
     if module_info.get("module_type") != "Isu" or method_name != "comb_issue":
@@ -1131,7 +1187,7 @@ def _drop_unhelpful_root_reads(module_info, method_name, reads):
 
 def _drop_self_feedback_reads(module_info, method_name, reads, writes):
     # read-set 与 write-set 同时包含同一 out.* 路径时，
-    # snippet 会把“本应由方法计算的输出”回灌成自由输入，容易诱导出锁存/抄输入实现。
+    # snippet 会把"本应由方法计算的输出"回灌成自由输入，容易诱导出锁存/抄输入实现。
     # 在当前 Isu 组合方法里，这类路径通常不是方法输入，而是方法内部写目标。
     if module_info.get("module_type") != "Isu":
         return reads
@@ -1149,7 +1205,7 @@ def _drop_self_feedback_reads(module_info, method_name, reads, writes):
 
 def _fallback_write_targets(module_info, method_name, method_body=None):
     # 当 libclang 没提到某些写路径时，这里用文本级赋值分析做保守补齐。
-    # 它不如 AST 精确，但能覆盖不少“简单赋值却未被主通道捕捉”的情况。
+    # 它不如 AST 精确，但能覆盖不少"简单赋值却未被主通道捕捉"的情况。
     method = next((m for m in module_info["methods"] if m["name"] == method_name), None)
     if not method:
         return []
@@ -1419,7 +1475,7 @@ def _default_decl_names(input_plan, compare_plan, snippet_code):
 
 def _order_signal_leaves_by_dependency(leaves):
     # compare_plan 里的叶子信号有时会互相依赖，例如某个数组索引本身就是另一个信号。
-    # 这里做一个轻量的拓扑排序，尽量保证“先解依赖、后用依赖”。
+    # 这里做一个轻量的拓扑排序，尽量保证"先解依赖、后用依赖"。
     if len(leaves) <= 1:
         return leaves
     known = {leaf["sv_expr"] for leaf in leaves}
@@ -1468,7 +1524,7 @@ def _build_roots(module_info, instance_name):
     # - in.*
     # - out.*
     # - 模块内部状态
-    # 后面的路径展开都建立在这份“根节点表”上。
+    # 后面的路径展开都建立在这份"根节点表"上。
     roots = {}
     structs = module_info["structs"]
     in_type = _module_interface_type(module_info, "in")
@@ -1521,7 +1577,7 @@ def _sv_leaf_expr(module_info, label, width_hint=None):
 
 def _packed_subpath_offset(module_info, type_name, width, tokens):
     # packed struct / packed array 的子字段访问，在 snippet wrapper 里最终要转成位切片。
-    # 这个函数负责递归计算“从根 packed 对象起，目标字段的 lsb 偏移和叶子宽度”。
+    # 这个函数负责递归计算"从根 packed 对象起，目标字段的 lsb 偏移和叶子宽度"。
     if not tokens:
         total_width = _packed_total_width(module_info, type_name, width, [])
         return ("0", total_width) if total_width is not None else (None, None)
@@ -1978,7 +2034,7 @@ def _sv_packed_offset_expr(expr):
 
 
 def _sv_path_expr(path):
-    # 普通“路径字符串 -> SV 表达式”转换。
+    # 普通"路径字符串 -> SV 表达式"转换。
     # 与 _sv_leaf_expr 的区别是：这里不做 packed bit offset 计算，只保留结构化访问形式。
     tokens = _split_path_tokens(path.replace("->", "."))
     if not tokens:
@@ -2007,6 +2063,9 @@ def _sv_path_expr(path):
 def sanitize_snippet_code(snippet_code):
     """Apply conservative syntax rewrites for parser-unsafe snippet idioms."""
     out = snippet_code or ""
+    # Strip lines referencing C++ management objects that don't exist in SV
+    # (e.g. ctx.perf.idu_tag_stall, ctx->something)
+    out = re.sub(r'^[^\n]*\bctx\s*[.>]\s*\S.*$\n?', '', out, flags=re.MULTILINE)
     # Rewrite invalid part-select on parenthesized expressions:
     #   (expr)[N:0] -> ((expr) & W'hmask)
     # Keep this conservative and only handle constant ranges.
@@ -2033,6 +2092,52 @@ def sanitize_snippet_code(snippet_code):
     # Keep this targeted to parenthesized expression form to avoid touching
     # sized literals like 32'h1234.
     out = re.sub(r"\b\d+\s*'\s*\(\s*([^()]+?)\s*\)", r"(\1)", out)
+    # Fix invalid binary literals like 5'b2 (digit > 1 in base-2) -> 5'd2
+    def _fix_bin_literal(m):
+        width = m.group(1)
+        val = m.group(2)
+        # Only fix if value contains non-binary digits (digits > 1)
+        if re.fullmatch(r'[01_]+', val):
+            return m.group(0)
+        try:
+            return f"{width}'d{int(val)}"
+        except ValueError:
+            return m.group(0)
+    out = re.sub(r"\b(\d+)'b([0-9]+)\b", _fix_bin_literal, out)
+    # Rewrite for-loops with runtime init to constant-bound loops with guard.
+    # yosys requires: "Right hand side of 1st expression of procedural for-loop is constant"
+    # Pattern: for (j = <runtime>; j < N; j = j + 1) begin ... end
+    # Becomes: for (j = 0; j < N; j = j + 1) begin if (j >= <runtime>) begin ... end end end
+    def _fix_for_runtime_init(code):
+        pat = re.compile(
+            r"([ \t]*)for\s*\(\s*(\w+)\s*=\s*([^;]+?)\s*;\s*\2\s*<\s*(\d+)\s*;\s*\2\s*=\s*\2\s*\+\s*1\s*\)\s*begin\s*\n(.*?)\n(\1)end",
+            re.DOTALL,
+        )
+        def repl(m):
+            indent = m.group(1)
+            var = m.group(2)
+            init_expr = m.group(3).strip()
+            bound = m.group(4)
+            body = m.group(5)
+            if re.fullmatch(r'\d+', init_expr):
+                return m.group(0)
+            inner_indent = indent + "    "
+            body_lines = body.split('\n')
+            # Strip one level of existing indent from body lines (they'll be re-indented)
+            stripped = []
+            for bl in body_lines:
+                if bl.startswith(indent + "    "):
+                    stripped.append(bl[len(indent) + 4:])
+                else:
+                    stripped.append(bl)
+            guarded_body = '\n'.join((inner_indent + "    ") + l.lstrip() for l in stripped)
+            return (f"{indent}for ({var} = 0; {var} < {bound}; {var} = {var} + 1) begin\n"
+                    f"{inner_indent}if ({var} >= {init_expr}) begin\n"
+                    f"{guarded_body}\n"
+                    f"{inner_indent}end\n"
+                    f"{indent}end")
+        return pat.sub(repl, code)
+    out = _fix_for_runtime_init(out)
     return out
 
 
@@ -2141,7 +2246,7 @@ def _build_cpp_input_unpack(input_plan):
 
 def _expand_local_aliases(text):
     # C++ method 中常见 `foo_t *p = &obj.xxx;` / `auto &ref = ...;` 这类本地别名。
-    # 后面的文本路径分析不理解“别名再取字段”，所以先把显式别名展开回原路径。
+    # 后面的文本路径分析不理解"别名再取字段"，所以先把显式别名展开回原路径。
     # 这是启发式处理，不是完整 C++ 语义。
     if not text:
         return text
@@ -2183,7 +2288,7 @@ def _find_assignment_operator(stmt):
 
 
 def _extract_precise_signal_paths(text):
-    # 这是文本级的“精确路径扫描器”：
+    # 这是文本级的"精确路径扫描器"：
     # 它会保留数组下标和多级字段，尽量从 C++ 语句中还原出接近原样的信号路径。
     # snippet 阶段很多 fallback 逻辑都依赖这份更细粒度的路径信息。
     out = []

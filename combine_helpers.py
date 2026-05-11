@@ -111,7 +111,11 @@ def build_combined_module_sv(bf, combine_info, snippets, default_strategy="zero_
     ]
     if sv_constants:
         for cname, cval in sv_constants:
-            parts.append(f"localparam int {cname} = {cval};")
+            ival = int(cval) if isinstance(cval, (int, str)) else None
+            if ival is not None and ival.bit_length() > 32:
+                parts.append(f"localparam logic [63:0] {cname} = 64'd{cval};")
+            else:
+                parts.append(f"localparam int {cname} = {cval};")
     else:
         parts.append("// (none)")
 

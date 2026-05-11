@@ -41,7 +41,15 @@ def generate_pi_sv(inputs, max_width=None, module_info=None):
 def _po_path_to_sv(path):
     """Convert a simulator_to_po C++ path into the framework SV naming style."""
     from sv_path import cpp_path_to_sv
-    path = re.sub(r"^(?!out\.|in\.)\w+\.", "", path, count=1)
+    # Only strip prefixes from known IO struct names (C++ wrapper local variables)
+    # that are NOT actual SV declared variables like br_latch_1, tag_vec_1, etc.
+    io_struct_prefixes = re.compile(
+        r"^(rob_bcast|dec_bcast|dec2ren|idu_consume|issue|ren2dec|exu2id"
+        r"|rob_commit|dis_rob|ren_dis|rob_dis|prf_dis"
+        r"|csr_(?:req|resp|rob|int_io)"
+        r"|ftq_pc_(?:req|resp)"
+        r")\.", re.IGNORECASE)
+    path = io_struct_prefixes.sub("", path, count=1)
     return cpp_path_to_sv(path)
 
 

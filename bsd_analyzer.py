@@ -136,7 +136,7 @@ def _detect_module_type(bsd_dir):
             continue
         with open(os.path.join(bsd_dir, fname)) as fh:
             content = fh.read()
-        for match in re.finditer(r'#include\s*<([A-Za-z_]\w*)\.h>', content):
+        for match in re.finditer(r'#include\s*[<"]([A-Za-z_]\w*)\.h[>"]', content):
             name = match.group(1)
             cpp_source = os.path.join(SIMULATOR_INCLUDE, f"{name}_cpp.h")
             if name not in ignore and os.path.exists(cpp_source):

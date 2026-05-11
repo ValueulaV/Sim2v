@@ -549,25 +549,36 @@ def _looks_like_method_start(line, record_name=None):
     return bool(re.match(r"(?:static\s+)?(?:inline\s+)?[\w:<>~*&,\s]+\s+\w+\s*\(", line))
 
 
+def _skip_inline_body(lines_iter):
+    depth = 0
+    for raw in lines_iter:
+        line = raw.strip()
+        depth += line.count("{") - line.count("}")
+        if depth <= 0:
+            break
+
+
 def _prepare_record_body_for_fields(body, record_name=None):
     body = _strip_nested_record_defs(body)
+    lines_list = body.split("\n")
+    it = iter(lines_list)
     lines = []
-    for raw in body.split("\n"):
+    for raw in it:
         line = raw.strip()
         if not line:
             continue
         if line in ("public:", "private:", "protected:"):
             continue
         if _looks_like_method_start(line, record_name):
-            # Method declarations (`foo();`) may appear before data members in
-            # some module headers (e.g. ROB). Skip declarations but stop at
-            # inline method bodies to avoid parsing function code as fields.
-            # Strip trailing comments before checking for semicolon, since
-            # `void comb_begin(); // comment` should be treated as a declaration.
             stripped_for_check = re.sub(r'\s*//.*$', '', line)
             if stripped_for_check.rstrip().endswith(";") and "{" not in line:
                 continue
-            break
+            # Inline method body: skip to matching closing brace, then continue
+            if "{" in line:
+                depth = line.count("{") - line.count("}")
+                if depth > 0:
+                    _skip_inline_body(it)
+            continue
         lines.append(line)
     return "\n".join(lines)
 
@@ -656,6 +667,17 @@ def _parse_file_structs(content, existing_type_widths=None):
         elif base_type in type_widths:
             type_widths[alias] = type_widths[base_type]
 
+    # Handle C++ using aliases: "using Alias = BaseType;"
+    for m in re.finditer(r"using\s+(\w+)\s*=\s*([A-Za-z_]\w*)\s*;", content):
+        alias, base_type = m.group(1), m.group(2)
+        if base_type in type_widths:
+            type_widths[alias] = type_widths[base_type]
+
+    # Build alias map for struct resolution: alias -> real struct name
+    _using_aliases = {}
+    for m in re.finditer(r"using\s+(\w+)\s*=\s*([A-Za-z_]\w*)\s*;", content):
+        _using_aliases[m.group(1)] = m.group(2)
+
     for record in _iter_record_defs(content):
         nested_tw, nested_structs, nested_sources = _parse_file_structs(record["body"], type_widths)
         type_widths.update(nested_tw)
@@ -668,15 +690,40 @@ def _parse_file_structs(content, existing_type_widths=None):
             structs[record["name"]] = fields
             struct_sources[record["name"]] = record["source"]
 
+    # Resolve using aliases: alias -> real struct
+    for alias, base in _using_aliases.items():
+        if base in structs and alias not in structs:
+            structs[alias] = structs[base]
+            struct_sources[alias] = struct_sources.get(base, "")
+
     return type_widths, structs, struct_sources
 
 
 def _parse_struct_fields(body, type_widths, record_name=None):
-    # 字段解析只覆盖当前项目里常见的“简单声明 + 数组维度”模式。
+    # 字段解析只覆盖当前项目里常见的"简单声明 + 数组维度"模式。
     # 复杂模板、函数指针、宏展开类型等都不在这个解析器的目标范围内。
     fields = []
-    for raw in body.split("\n"):
+    # Pre-join multi-line declarations: type on one line, field name on next
+    raw_lines = body.split("\n")
+    joined_lines = []
+    pending_type = None
+    for raw in raw_lines:
         line = raw.strip()
+        if not line or line.startswith("//") or line.startswith("#"):
+            continue
+        if line.startswith(("return ", "if ", "for ", "while ", "switch ", "else", "break", "continue")):
+            continue
+        # Check if this is a type-only line (no semicolon, looks like a type name)
+        type_m = re.match(r"^([~\w:<>]+(?:\s*<[^;]+>)?)\s*$", line)
+        if type_m and ";" not in line:
+            pending_type = type_m.group(1).strip()
+            continue
+        if pending_type:
+            line = pending_type + " " + line
+            pending_type = None
+        joined_lines.append(line)
+
+    for line in joined_lines:
         if not line or line.startswith("//") or line.startswith("#"):
             continue
         if line.startswith(("return ", "if ", "for ", "while ", "switch ", "else", "break", "continue")):
@@ -746,7 +793,7 @@ def _validate_signal_paths(outputs, structs, type_widths, module_type):
 
 def parse_helper_functions():
     # helper 目前统一从 util.h 提取。
-    # 这是 prompt/snippet 两边共享的“辅助语义上下文”来源。
+    # 这是 prompt/snippet 两边共享的"辅助语义上下文"来源。
     util_path = os.path.join(SIMULATOR_INCLUDE, "util.h")
     with open(util_path) as f:
         content = f.read()
@@ -759,7 +806,11 @@ def parse_helper_functions():
     for m in func_pat.finditer(content):
         name = m.group(2)
         body = _extract_braced_body(content, m.end())
-        helpers[name] = m.group(1) + "\n" + body.rstrip() + "\n}"
+        src = m.group(1) + "\n" + body.rstrip() + "\n}"
+        if name in helpers:
+            helpers[name] = helpers[name] + "\n\n" + src
+        else:
+            helpers[name] = src
     return helpers
 
 
@@ -807,7 +858,7 @@ def _cpp_type_to_sv(type_name, width, structs):
 
 
 def _topo_sort_structs(structs, relevant):
-    # SV typedef 生成时必须保证“被依赖类型先定义”。
+    # SV typedef 生成时必须保证"被依赖类型先定义"。
     # 这里对相关 struct 做一个轻量拓扑排序，避免前向引用带来的声明问题。
     deps = {}
     for sname in relevant:
@@ -1019,10 +1070,11 @@ def generate_sv_var_declarations(structs, module_type):
     input_decls = decls_for_class(in_class, "in_")
     output_decls = decls_for_class(out_class, "out_")
 
+    _SKIP_FIELDS = {"ctx"}
     internal_decls = []
     if module_type in structs:
         for field in structs[module_type]:
-            if field["name"] in ("in", "out"):
+            if field["name"] in ("in", "out") or field["name"] in _SKIP_FIELDS:
                 continue
             sv = _cpp_type_to_sv(field["type"], field["width"], structs)
             if sv is None:
@@ -1043,8 +1095,9 @@ def _build_root_var_type_map(structs, module_type):
         add_var(f"in_{escape_sv_keyword(field['name'])}", field)
     for field in structs.get(_module_interface_type(structs, module_type, "out"), []):
         add_var(f"out_{escape_sv_keyword(field['name'])}", field)
+    _SKIP_ROOTS = {"ctx"}
     for field in structs.get(module_type, []):
-        if field["name"] not in ("in", "out"):
+        if field["name"] not in ("in", "out") and field["name"] not in _SKIP_ROOTS:
             add_var(escape_sv_keyword(field["name"]), field)
     return roots
 

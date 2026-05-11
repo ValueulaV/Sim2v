@@ -424,6 +424,23 @@ Method-specific constraints:
 	  Replace `privilege < 3` with `1'b1` (always true). Replace `privilege == 3` with
 	  `privilege == 2'b11` to avoid CMPCONST warnings.
 	""",
+    ("Idu", "comb_decode"): """\
+	Method-specific constraints:
+	- CONFIG_BPU is NOT defined in this project. The C++ source contains `#ifndef CONFIG_BPU ... #else ... #endif`.
+	  You MUST translate ONLY the `#ifndef CONFIG_BPU` branch (the non-BPU path). Ignore the `#else` BPU path entirely.
+	- In the non-BPU path, `br_id` is always set to 0 and `br_mask` is always set to 0 for all decoded instructions.
+	- Do NOT implement any branch tag allocation logic, running_mask computation, or br_num tracking.
+	""",
+    ("Idu", "comb_fire"): """\
+	Method-specific constraints:
+	- CONFIG_BPU is NOT defined in this project. The C++ source contains `#ifdef CONFIG_BPU` guards.
+	  You MUST skip all code inside `#ifdef CONFIG_BPU ... #endif` blocks entirely.
+	  Do NOT implement branch tag allocation (alloc_tag), br_num tracking, or checkpoint save logic.
+	- Without CONFIG_BPU, the method only handles flush, matured_free release, clear_mask application,
+	  misprediction recovery, and the basic fire/dispatch loop without branch tag management.
+	- In step 3 (clear checkpoints), the C++ loop starts from `i = 1`, NOT `i = 0`.
+	  `br_mask_cp_1[0]` is never modified by the clear loop.
+	""",
 }
 
 
