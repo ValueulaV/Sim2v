@@ -15,7 +15,8 @@ input_dirs:
   # - io_generator/prf_bsd
   # - io_generator/rob_bsd
   # - io_generator/isu_bsd
-  - io_generator/csr_bsd
+  # - io_generator/csr_bsd
+  - io_generator/idu_bsd
 
 output_dir: output
 
